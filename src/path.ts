@@ -118,7 +118,11 @@ function leash(path: number[], subject: number[], halfWindow: (i: number) => num
   );
 }
 
-/** Crop window at an arbitrary time, lerped between path keys. */
+/**
+ * Crop window at an arbitrary time. Catmull-Rom between path keys —
+ * linear interpolation has velocity corners at every key (5–10 per
+ * second), which read as bumpiness in the output.
+ */
 export function cropAt(path: CropKey[], t: number): CropKey {
   if (t <= path[0].t) return path[0];
   const last = path[path.length - 1];
@@ -130,15 +134,23 @@ export function cropAt(path: CropKey[], t: number): CropKey {
     if (path[mid].t <= t) lo = mid;
     else hi = mid;
   }
-  const a = path[lo];
-  const b = path[hi];
-  const f = (t - a.t) / (b.t - a.t);
+  const p0 = path[Math.max(0, lo - 1)];
+  const p1 = path[lo];
+  const p2 = path[hi];
+  const p3 = path[Math.min(path.length - 1, hi + 1)];
+  const f = (t - p1.t) / (p2.t - p1.t);
+  const cr = (a: number, b: number, c: number, d: number) =>
+    0.5 *
+    (2 * b +
+      (-a + c) * f +
+      (2 * a - 5 * b + 4 * c - d) * f * f +
+      (-a + 3 * b - 3 * c + d) * f * f * f);
   return {
     t,
-    cx: a.cx + (b.cx - a.cx) * f,
-    cy: a.cy + (b.cy - a.cy) * f,
-    cropW: a.cropW + (b.cropW - a.cropW) * f,
-    cropH: a.cropH + (b.cropH - a.cropH) * f,
+    cx: cr(p0.cx, p1.cx, p2.cx, p3.cx),
+    cy: cr(p0.cy, p1.cy, p2.cy, p3.cy),
+    cropW: cr(p0.cropW, p1.cropW, p2.cropW, p3.cropW),
+    cropH: cr(p0.cropH, p1.cropH, p2.cropH, p3.cropH),
   };
 }
 

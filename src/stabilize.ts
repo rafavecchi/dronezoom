@@ -29,6 +29,8 @@ export interface CameraPath {
   ys: number[];
   /** Cumulative roll, radians, about the frame center. */
   rs: number[];
+  /** Fraction of the clip's frames actually measured (1 = no drops). */
+  coverage: number;
 }
 
 const canvas = document.createElement('canvas');
@@ -269,11 +271,37 @@ export async function estimateCameraPath(
       rvfc(cb);
     };
     rvfc(cb);
-    video.playbackRate = 1;
+    // Half speed: the per-frame analysis costs more than a 60fps frame
+    // budget; playing slower keeps frame drops (= unmeasured frames) rare.
+    video.playbackRate = 0.5;
     void video.play();
   });
   video.pause();
-  return { ts, xs, ys, rs };
+  video.playbackRate = 1;
+
+  let minGap = Infinity;
+  for (let i = 1; i < ts.length; i++) minGap = Math.min(minGap, ts[i] - ts[i - 1]);
+  const expected = Math.max(1, Math.round(video.duration / Math.max(minGap, 1e-3)));
+  return { ts, xs, ys, rs, coverage: Math.min(1, ts.length / expected) };
+}
+
+/**
+ * Step (floor) lookup: value of the latest sample at or before t. Use
+ * this to apply per-frame corrections — a correction belongs to exactly
+ * one frame, and interpolating between frames misapplies it.
+ */
+export function stepSeries(ts: number[], vals: number[], t: number): number {
+  if (t <= ts[0]) return vals[0];
+  const n = ts.length;
+  if (t >= ts[n - 1]) return vals[n - 1];
+  let lo = 0;
+  let hi = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (ts[mid] <= t) lo = mid;
+    else hi = mid;
+  }
+  return vals[lo];
 }
 
 /** Linear interpolation over a (sorted ts, values) series. */

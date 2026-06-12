@@ -1,6 +1,6 @@
 import { initDetector, detectPersons } from './detect';
 import { buildCropPath, cropAt, gaussianSmooth, type Sample, type CropKey } from './path';
-import { estimateCameraPath, cameraAt, lerpSeries, type CameraPath } from './stabilize';
+import { estimateCameraPath, lerpSeries, stepSeries, type CameraPath } from './stabilize';
 import { Tracker, type Point } from './tracker';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -37,6 +37,11 @@ let seedT = 0;
 let seedDirty = false;
 let scrubbing = false;
 let camPath: CameraPath | null = null;
+// mediaTime of the actually-presented video frame. video.currentTime is
+// the playback head and can lead the displayed frame by up to a frame —
+// applying a per-frame shake correction at the wrong frame *adds* jitter
+// instead of canceling it.
+let displayT: number | null = null;
 // Smoothed roll: the intended slow camera leveling; the residual
 // (instantaneous minus smoothed) is the roll shake we counter-rotate.
 let smoothRoll: number[] = [];
@@ -56,7 +61,13 @@ interface Cam {
 }
 
 function camOffset(t: number): Cam {
-  return stabilizeChk.checked && camPath ? cameraAt(camPath, t) : { x: 0, y: 0, r: 0 };
+  if (!stabilizeChk.checked || !camPath) return { x: 0, y: 0, r: 0 };
+  // Step lookup: a correction belongs to exactly one frame.
+  return {
+    x: stepSeries(camPath.ts, camPath.xs, t),
+    y: stepSeries(camPath.ts, camPath.ys, t),
+    r: stepSeries(camPath.ts, camPath.rs, t),
+  };
 }
 
 function smoothRollAt(t: number): number {
@@ -173,7 +184,7 @@ function nearestSample(t: number): Sample | undefined {
 
 function drawFrame() {
   if (!video.videoWidth) return;
-  const t = video.currentTime;
+  const t = displayT ?? video.currentTime;
   const ow = originalCanvas.width;
   const oh = originalCanvas.height;
   const scale = ow / video.videoWidth;
@@ -260,6 +271,28 @@ function seekTo(t: number): Promise<void> {
     video.currentTime = t;
   });
 }
+
+// Track the mediaTime of every presented frame. Registered once; the
+// callback chain survives src changes.
+let presentLoopStarted = false;
+function startPresentLoop() {
+  if (presentLoopStarted) return;
+  const rvfc = (
+    video as unknown as {
+      requestVideoFrameCallback?: (cb: (now: number, meta: { mediaTime: number }) => void) => number;
+    }
+  ).requestVideoFrameCallback?.bind(video);
+  if (!rvfc) return; // drawFrame falls back to video.currentTime
+  presentLoopStarted = true;
+  const cb = (_now: number, meta: { mediaTime: number }) => {
+    displayT = meta.mediaTime;
+    rvfc(cb);
+  };
+  rvfc(cb);
+}
+video.addEventListener('seeked', () => {
+  displayT = video.currentTime;
+});
 
 async function analyze() {
   if (!seedPoint) {
@@ -367,9 +400,12 @@ async function analyze() {
   rebuildPath();
   await seekTo(0);
   drawFrame();
+  const covNote = camPath
+    ? `, shake measured for ${(camPath.coverage * 100).toFixed(0)}% of frames` +
+      (camPath.coverage < 0.85 ? ' (low — uncovered frames stay shaky)' : '')
+    : '';
   setStatus(
-    `Done in ${secs}s — rider in ${detected}/${samples.length} samples (${roiHits} via zoomed re-detect)` +
-      `${camPath ? ', shake measured per frame' : ''}. ` +
+    `Done in ${secs}s — rider in ${detected}/${samples.length} samples (${roiHits} via zoomed re-detect)${covNote}. ` +
       `Toggle "stabilize" to compare; if tracking drifts, click yourself at that moment and re-Analyze.`,
   );
 }
@@ -383,9 +419,11 @@ fileInput.addEventListener('change', () => {
   camPath = null;
   seedPoint = null;
   seedDirty = false;
+  displayT = null;
   video.addEventListener(
     'loadedmetadata',
     () => {
+      startPresentLoop();
       sizeCanvases();
       void seekTo(0.01).then(drawFrame);
       analyzeBtn.disabled = false;
