@@ -1,4 +1,4 @@
-import type { Detection, Region } from './detect';
+import type { Detection } from './detect';
 
 export interface Sample {
   t: number;
@@ -22,102 +22,6 @@ export interface PathOptions {
   maxZoom: number;
   /** Spacing between samples, in seconds. */
   sampleInterval: number;
-}
-
-export interface Point {
-  x: number;
-  y: number;
-}
-
-/**
- * Single-target tracker seeded by a user click. Predicts the rider's
- * position with constant velocity, only accepts detections inside a
- * speed-limited gate (so a hiker across the frame can never steal the
- * camera — a far-away detection is a miss, not a switch), and tells the
- * caller where to re-look with a zoomed-in detection pass after misses.
- */
-export class Tracker {
-  private last: Detection | null = null;
-  private lastT = 0;
-  private vx = 0;
-  private vy = 0;
-  private readonly diag: number;
-
-  constructor(
-    private seed: Point,
-    private srcW: number,
-    private srcH: number,
-  ) {
-    this.diag = Math.hypot(srcW, srcH);
-  }
-
-  get acquired(): boolean {
-    return this.last !== null;
-  }
-
-  predict(t: number): Point {
-    if (!this.last) return this.seed;
-    // Cap extrapolation so a long miss streak doesn't run the prediction
-    // off into the weeds.
-    const dt = Math.min(t - this.lastT, 1.5);
-    return {
-      x: clamp(this.last.cx + this.vx * dt, 0, this.srcW),
-      y: clamp(this.last.cy + this.vy * dt, 0, this.srcH),
-    };
-  }
-
-  /** Zoomed re-detection window around the predicted position. */
-  searchRegion(t: number): Region {
-    const p = this.predict(t);
-    const size = this.last
-      ? clamp(this.last.h * 8, 480, this.srcH)
-      : Math.max(480, this.srcH / 2);
-    return {
-      x: clamp(p.x - size / 2, 0, this.srcW - size),
-      y: clamp(p.y - size / 2, 0, Math.max(0, this.srcH - size)),
-      w: Math.min(size, this.srcW),
-      h: Math.min(size, this.srcH),
-    };
-  }
-
-  match(dets: Detection[], t: number): Detection | null {
-    const p = this.predict(t);
-    const gate = this.gateRadius(t);
-    let best: Detection | null = null;
-    let bestCost = Infinity;
-    for (const d of dets) {
-      const dist = Math.hypot(d.cx - p.x, d.cy - p.y);
-      if (dist > gate) continue;
-      // Reject size jumps a real rider can't make between samples.
-      if (this.last) {
-        const ratio = d.h / this.last.h;
-        if (ratio < 0.4 || ratio > 2.5) continue;
-      }
-      const cost = dist / this.diag - d.score * 0.2;
-      if (cost < bestCost) {
-        bestCost = cost;
-        best = d;
-      }
-    }
-    if (best) {
-      const dt = t - this.lastT;
-      if (this.last && dt > 0 && dt < 1.5) {
-        // EMA so one noisy box doesn't slingshot the velocity estimate.
-        this.vx = 0.5 * this.vx + (0.5 * (best.cx - this.last.cx)) / dt;
-        this.vy = 0.5 * this.vy + (0.5 * (best.cy - this.last.cy)) / dt;
-      }
-      this.last = best;
-      this.lastT = t;
-    }
-    return best;
-  }
-
-  private gateRadius(t: number): number {
-    if (!this.last) return 0.15 * this.diag; // first acquisition, around the seed click
-    const dt = t - this.lastT;
-    const maxSpeed = 0.4 * this.diag; // px/s — generous for a fast descent
-    return Math.min(0.3 * this.diag, 0.04 * this.diag + maxSpeed * dt);
-  }
 }
 
 /**

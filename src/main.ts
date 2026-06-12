@@ -1,5 +1,6 @@
 import { initDetector, detectPersons } from './detect';
-import { buildCropPath, cropAt, Tracker, type Point, type Sample, type CropKey } from './path';
+import { buildCropPath, cropAt, type Sample, type CropKey } from './path';
+import { Tracker, type Point } from './tracker';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -13,6 +14,7 @@ const smoothSlider = $<HTMLInputElement>('smoothSlider');
 const smoothValue = $<HTMLSpanElement>('smoothValue');
 const showBoxes = $<HTMLInputElement>('showBoxes');
 const statusEl = $<HTMLParagraphElement>('status');
+const scrubBar = $<HTMLInputElement>('scrubBar');
 const progressBar = $<HTMLProgressElement>('progressBar');
 const video = $<HTMLVideoElement>('video');
 const originalCanvas = $<HTMLCanvasElement>('originalCanvas');
@@ -29,6 +31,9 @@ let cropPath: CropKey[] = [];
 let analyzing = false;
 let rafHandle = 0;
 let seedPoint: Point | null = null;
+let seedT = 0;
+let seedDirty = false;
+let scrubbing = false;
 
 function setStatus(msg: string, isError = false) {
   statusEl.textContent = msg;
@@ -104,7 +109,7 @@ function drawFrame() {
     }
   }
 
-  if (seedPoint && samples.length === 0) {
+  if (seedPoint && (seedDirty || samples.length === 0)) {
     const sx = seedPoint.x * scale;
     const sy = seedPoint.y * scale;
     originalCtx.strokeStyle = '#ffd24a';
@@ -137,6 +142,9 @@ function drawFrame() {
 
 function renderLoop() {
   drawFrame();
+  if (!scrubbing && !analyzing && video.videoWidth) {
+    scrubBar.value = String(video.currentTime);
+  }
   rafHandle = requestAnimationFrame(renderLoop);
 }
 
@@ -153,6 +161,7 @@ async function analyze() {
     return;
   }
   analyzing = true;
+  seedDirty = false;
   analyzeBtn.disabled = true;
   playBtn.disabled = true;
   video.pause();
@@ -160,42 +169,56 @@ async function analyze() {
   cropPath = [];
 
   const { videoWidth: w, videoHeight: h } = video;
-  const tracker = new Tracker(seedPoint, w, h);
   const interval = parseFloat(strideSel.value);
   const duration = video.duration;
+  const seedTime = Math.min(seedT, Math.max(0, duration - 0.05));
   const total = Math.floor(duration / interval) + 1;
   progressBar.hidden = false;
   const startedAt = performance.now();
 
   let detected = 0;
   let roiHits = 0;
-  for (let i = 0; i * interval < duration; i++) {
-    const t = i * interval;
+  let processed = 0;
+
+  // Full-frame pass first; if that misses, a zoomed pass around the
+  // predicted position — a rider ~20px tall in downscaled 4K is often
+  // only findable the second way.
+  const detectAt = async (tracker: Tracker, t: number) => {
     await seekTo(t);
-    let box = null;
-    try {
-      // Pass 1: full frame. Pass 2: zoomed window around the predicted
-      // position — a rider that's 20px tall in a downscaled 4K frame is
-      // often only findable this way.
-      box = tracker.match(await detectPersons(video, w, h), t);
-      if (!box) {
-        const roi = tracker.searchRegion(t);
-        box = tracker.match(await detectPersons(video, w, h, roi), t);
-        if (box) roiHits++;
-      }
-    } catch (e) {
-      setStatus(`Detection failed at ${t.toFixed(1)}s: ${e}`, true);
-      break;
+    let box = tracker.match(video, await detectPersons(video, w, h), t);
+    if (!box) {
+      box = tracker.match(video, await detectPersons(video, w, h, tracker.searchRegion(t)), t);
+      if (box) roiHits++;
     }
+    processed++;
     if (box) detected++;
-    samples.push({ t, box });
-    progressBar.value = (i + 1) / total;
-    if (i % 5 === 0) {
+    progressBar.value = processed / total;
+    if (processed % 5 === 0) {
       setStatus(
-        `Analyzing… ${t.toFixed(1)}s / ${duration.toFixed(1)}s — rider in ${detected}/${i + 1} samples (${roiHits} via zoomed re-detect)`,
+        `Analyzing… ${processed}/${total} samples — rider in ${detected} (${roiHits} via zoomed re-detect)`,
       );
       drawFrame();
     }
+    return box;
+  };
+
+  try {
+    // Track outward from the seeded frame in both directions, sharing the
+    // appearance template, so the click anchors identity for the whole clip.
+    const forward = new Tracker({ ...seedPoint }, w, h);
+    const fwdSamples: Sample[] = [];
+    for (let t = seedTime; t < duration; t += interval) {
+      fwdSamples.push({ t, box: await detectAt(forward, t) });
+    }
+    const backward = new Tracker({ ...seedPoint }, w, h, forward.appearance);
+    const bwdSamples: Sample[] = [];
+    for (let t = seedTime - interval; t >= 0; t -= interval) {
+      bwdSamples.push({ t, box: await detectAt(backward, t) });
+    }
+    samples = [...bwdSamples.reverse(), ...fwdSamples];
+  } catch (e) {
+    setStatus(`Detection failed: ${e}`, true);
+    samples = [];
   }
 
   const secs = ((performance.now() - startedAt) / 1000).toFixed(1);
@@ -203,13 +226,14 @@ async function analyze() {
   analyzing = false;
   analyzeBtn.disabled = false;
   playBtn.disabled = false;
+  if (samples.length === 0) return;
 
   rebuildPath();
   await seekTo(0);
   drawFrame();
   setStatus(
-    `Done in ${secs}s — rider detected in ${detected}/${samples.length} samples. ` +
-      `Tune the sliders (instant, no re-analysis needed) and hit Play.`,
+    `Done in ${secs}s — rider in ${detected}/${samples.length} samples (${roiHits} via zoomed re-detect). ` +
+      `Scrub through it; if tracking drifts, click yourself at that moment and re-Analyze.`,
   );
 }
 
@@ -220,6 +244,7 @@ fileInput.addEventListener('change', () => {
   samples = [];
   cropPath = [];
   seedPoint = null;
+  seedDirty = false;
   video.addEventListener(
     'loadedmetadata',
     () => {
@@ -227,9 +252,12 @@ fileInput.addEventListener('change', () => {
       void seekTo(0.01).then(drawFrame);
       analyzeBtn.disabled = false;
       playBtn.disabled = false;
+      scrubBar.disabled = false;
+      scrubBar.max = String(video.duration);
+      scrubBar.value = '0';
       setStatus(
         `${file.name} — ${video.videoWidth}×${video.videoHeight}, ${video.duration.toFixed(1)}s. ` +
-          `Click on yourself in the left frame, then Analyze.`,
+          `Find yourself (scrub to any frame) and click on yourself in the left view, then Analyze.`,
       );
     },
     { once: true },
@@ -243,11 +271,22 @@ originalCanvas.addEventListener('click', (e) => {
     x: ((e.clientX - rect.left) / rect.width) * video.videoWidth,
     y: ((e.clientY - rect.top) / rect.height) * video.videoHeight,
   };
-  samples = [];
-  cropPath = [];
+  seedT = video.currentTime;
+  seedDirty = true;
   drawFrame();
-  setStatus('Target set. Hit Analyze. (Scrub-free: tracking always starts from the first frame.)');
+  setStatus(
+    `Target set at ${seedT.toFixed(1)}s — hit Analyze. Tracking runs forward and backward from this frame.`,
+  );
 });
+
+scrubBar.addEventListener('input', () => {
+  if (analyzing) return;
+  video.pause();
+  playBtn.textContent = 'Play';
+  video.currentTime = parseFloat(scrubBar.value);
+});
+scrubBar.addEventListener('pointerdown', () => (scrubbing = true));
+window.addEventListener('pointerup', () => (scrubbing = false));
 
 analyzeBtn.addEventListener('click', () => void analyze());
 
