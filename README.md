@@ -30,6 +30,22 @@ npm run dev
 Open the printed URL in Chrome/Edge (WebGPU). Firefox/Safari fall back to CPU
 inference — works, but the analyze pass is much slower.
 
+## Export to Google Drive
+
+The "→ Drive" button uploads the last export to your Drive (scope
+`drive.file`: the app can only see files it creates). One-time setup:
+
+1. [console.cloud.google.com](https://console.cloud.google.com) → create
+   (or pick) a project.
+2. APIs & Services → Library → enable **Google Drive API**.
+3. APIs & Services → OAuth consent screen → External → add yourself as a
+   test user.
+4. APIs & Services → Credentials → Create credentials → **OAuth client
+   ID** → Web application → add `http://localhost:5173` under
+   *Authorized JavaScript origins*.
+5. Copy the client ID; the app prompts for it on first upload (stored in
+   localStorage).
+
 ## Roadmap
 
 - **Milestone 2 — Export:** WebCodecs decode → render crop per frame → encode →

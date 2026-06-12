@@ -1,5 +1,6 @@
 import { runAnalysis, probeFps, type AnalysisResult } from './analyze';
 import { initDetector } from './detect';
+import { getClientId, setClientId, uploadToDrive } from './drive';
 import { exportVideo } from './export';
 import { apply, buildResiduals, decompose, IDENTITY, invert, type Affine } from './motion';
 import { buildCropPath, cropAt, gaussianSmooth, type Sample, type CropKey } from './path';
@@ -11,6 +12,7 @@ const fileInput = $<HTMLInputElement>('fileInput');
 const analyzeBtn = $<HTMLButtonElement>('analyzeBtn');
 const playBtn = $<HTMLButtonElement>('playBtn');
 const exportBtn = $<HTMLButtonElement>('exportBtn');
+const driveBtn = $<HTMLButtonElement>('driveBtn');
 const strideSel = $<HTMLSelectElement>('strideSel');
 const padSlider = $<HTMLInputElement>('padSlider');
 const padValue = $<HTMLSpanElement>('padValue');
@@ -45,6 +47,8 @@ let scrubbing = false;
 // mediaTime of the actually-presented frame; video.currentTime can lead
 // the displayed frame, which would misapply per-frame corrections.
 let displayT: number | null = null;
+let lastExport: { blob: Blob; name: string } | null = null;
+let clipName = 'clip';
 
 function clampNum(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
@@ -348,6 +352,9 @@ async function analyze() {
 fileInput.addEventListener('change', () => {
   const file = fileInput.files?.[0];
   if (!file) return;
+  clipName = file.name.replace(/\.[^.]+$/, '');
+  lastExport = null;
+  driveBtn.disabled = true;
   video.src = URL.createObjectURL(file);
   analysis = null;
   samples = [];
@@ -462,13 +469,17 @@ exportBtn.addEventListener('click', async () => {
         }
       },
     });
+    const name = `dronezoom-${clipName}.mp4`;
+    lastExport = { blob, name };
+    driveBtn.disabled = false;
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'dronezoom-export.mp4';
+    a.download = name;
     a.click();
     const secs = ((performance.now() - startedAt) / 1000).toFixed(0);
     setStatus(
-      `Exported ${(blob.size / 1e6).toFixed(1)} MB in ${secs}s (${outW}×${outH} @ ${fps}fps) — check your downloads.`,
+      `Exported ${(blob.size / 1e6).toFixed(1)} MB in ${secs}s (${outW}×${outH} @ ${fps}fps) — ` +
+        `downloaded; "→ Drive" uploads it to Google Drive.`,
     );
   } catch (e) {
     setStatus(`Export failed: ${e}`, true);
@@ -477,6 +488,46 @@ exportBtn.addEventListener('click', async () => {
     analyzeBtn.disabled = false;
     playBtn.disabled = false;
     exportBtn.disabled = false;
+    progressBar.hidden = true;
+  }
+});
+
+driveBtn.addEventListener('click', async () => {
+  if (!lastExport) return;
+  if (!getClientId()) {
+    const id = prompt(
+      'One-time setup: paste your Google OAuth Client ID.\n\n' +
+        'Get one (free) at console.cloud.google.com → APIs & Services →\n' +
+        'Credentials → Create OAuth client ID (Web application) with\n' +
+        `authorized JavaScript origin ${location.origin}, and enable the\n` +
+        'Google Drive API. Details in the README.',
+    );
+    if (!id?.trim()) return;
+    setClientId(id);
+  }
+  driveBtn.disabled = true;
+  progressBar.hidden = false;
+  progressBar.value = 0;
+  setStatus(`Uploading ${lastExport.name} to Google Drive…`);
+  try {
+    const file = await uploadToDrive(lastExport.blob, lastExport.name, (frac) => {
+      progressBar.value = frac;
+      setStatus(`Uploading to Drive… ${(frac * 100).toFixed(0)}%`);
+    });
+    statusEl.classList.remove('error');
+    statusEl.innerHTML = '';
+    statusEl.append(`Uploaded ${lastExport.name} to Google Drive — `);
+    const link = document.createElement('a');
+    link.href = file.link;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.textContent = 'open it';
+    link.style.color = 'var(--accent)';
+    statusEl.append(link);
+  } catch (e) {
+    setStatus(`Drive upload failed: ${e}`, true);
+  } finally {
+    driveBtn.disabled = false;
     progressBar.hidden = true;
   }
 });
