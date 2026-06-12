@@ -147,7 +147,7 @@ function medianFilter(values: number[], radius = 2): number[] {
   return out;
 }
 
-function gaussianSmooth(values: number[], sigma: number): number[] {
+export function gaussianSmooth(values: number[], sigma: number): number[] {
   if (sigma <= 0) return values.slice();
   const radius = Math.max(1, Math.ceil(sigma * 3));
   const kernel: number[] = [];

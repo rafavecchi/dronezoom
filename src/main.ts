@@ -1,6 +1,6 @@
 import { initDetector, detectPersons } from './detect';
-import { buildCropPath, cropAt, type Sample, type CropKey } from './path';
-import { estimateCameraPath, cameraAt, type CameraPath } from './stabilize';
+import { buildCropPath, cropAt, gaussianSmooth, type Sample, type CropKey } from './path';
+import { estimateCameraPath, cameraAt, lerpSeries, type CameraPath } from './stabilize';
 import { Tracker, type Point } from './tracker';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -37,13 +37,50 @@ let seedT = 0;
 let seedDirty = false;
 let scrubbing = false;
 let camPath: CameraPath | null = null;
+// Smoothed roll: the intended slow camera leveling; the residual
+// (instantaneous minus smoothed) is the roll shake we counter-rotate.
+let smoothRoll: number[] = [];
 
 function clampNum(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
 
-function camOffset(t: number): { x: number; y: number } {
-  return stabilizeChk.checked && camPath ? cameraAt(camPath, t) : { x: 0, y: 0 };
+interface Cam {
+  x: number;
+  y: number;
+  r: number;
+}
+
+function camOffset(t: number): Cam {
+  return stabilizeChk.checked && camPath ? cameraAt(camPath, t) : { x: 0, y: 0, r: 0 };
+}
+
+function smoothRollAt(t: number): number {
+  return stabilizeChk.checked && camPath && smoothRoll.length
+    ? lerpSeries(camPath.ts, smoothRoll, t)
+    : 0;
+}
+
+// Frame content = world rotated by cam.r about the frame center, then
+// translated by (cam.x, cam.y).
+function worldToFrame(x: number, y: number, cam: Cam): { x: number; y: number } {
+  const fcx = video.videoWidth / 2;
+  const fcy = video.videoHeight / 2;
+  const cos = Math.cos(cam.r);
+  const sin = Math.sin(cam.r);
+  const dx = x - fcx;
+  const dy = y - fcy;
+  return { x: fcx + cam.x + dx * cos - dy * sin, y: fcy + cam.y + dx * sin + dy * cos };
+}
+
+function frameToWorld(x: number, y: number, cam: Cam): { x: number; y: number } {
+  const fcx = video.videoWidth / 2;
+  const fcy = video.videoHeight / 2;
+  const cos = Math.cos(-cam.r);
+  const sin = Math.sin(-cam.r);
+  const dx = x - fcx - cam.x;
+  const dy = y - fcy - cam.y;
+  return { x: fcx + dx * cos - dy * sin, y: fcy + dx * sin + dy * cos };
 }
 
 function setStatus(msg: string, isError = false) {
@@ -62,13 +99,20 @@ function pathOptions() {
 
 function rebuildPath() {
   if (samples.length === 0) return;
+  if (camPath) {
+    // Per-frame samples are ~uniformly spaced, so sigma in samples is
+    // smoothing seconds divided by the average frame interval.
+    const dtAvg =
+      camPath.ts.length > 1 ? camPath.ts[camPath.ts.length - 1] / (camPath.ts.length - 1) : 1;
+    smoothRoll = gaussianSmooth(camPath.rs, parseFloat(smoothSlider.value) / dtAvg);
+  }
   // Move detections into stabilized "world" coordinates before smoothing:
-  // shake is removed from the subject signal, and the renderer adds each
-  // frame's camera offset back so it cancels exactly.
+  // shake is removed from the subject signal, and the renderer applies
+  // each frame's camera transform back so it cancels exactly.
   const worldSamples = samples.map((s) => {
     if (!s.box) return s;
-    const cam = camOffset(s.t);
-    return { t: s.t, box: { ...s.box, cx: s.box.cx - cam.x, cy: s.box.cy - cam.y } };
+    const w = frameToWorld(s.box.cx, s.box.cy, camOffset(s.t));
+    return { t: s.t, box: { ...s.box, cx: w.x, cy: w.y } };
   });
   cropPath = buildCropPath(worldSamples, video.videoWidth, video.videoHeight, pathOptions());
   drawFrame();
@@ -105,10 +149,13 @@ function drawFrame() {
   const crop = cropPath.length ? cropAt(cropPath, t) : null;
   let cropX = 0;
   let cropY = 0;
+  let rollResidual = 0;
   if (crop) {
     const cam = camOffset(t);
-    cropX = clampNum(crop.cx + cam.x, crop.cropW / 2, video.videoWidth - crop.cropW / 2);
-    cropY = clampNum(crop.cy + cam.y, crop.cropH / 2, video.videoHeight - crop.cropH / 2);
+    const q = worldToFrame(crop.cx, crop.cy, cam);
+    cropX = clampNum(q.x, crop.cropW / 2, video.videoWidth - crop.cropW / 2);
+    cropY = clampNum(q.y, crop.cropH / 2, video.videoHeight - crop.cropH / 2);
+    rollResidual = cam.r - smoothRollAt(t);
   }
 
   if (showBoxes.checked) {
@@ -150,17 +197,16 @@ function drawFrame() {
   }
 
   if (crop) {
-    previewCtx.drawImage(
-      video,
-      cropX - crop.cropW / 2,
-      cropY - crop.cropH / 2,
-      crop.cropW,
-      crop.cropH,
-      0,
-      0,
-      previewCanvas.width,
-      previewCanvas.height,
-    );
+    // Sample the source rotated by the inverse roll residual about the
+    // crop center, so roll shake cancels in the output.
+    const k = previewCanvas.width / crop.cropW;
+    previewCtx.setTransform(1, 0, 0, 1, 0, 0);
+    previewCtx.translate(previewCanvas.width / 2, previewCanvas.height / 2);
+    previewCtx.scale(k, k);
+    previewCtx.rotate(-rollResidual);
+    previewCtx.translate(-cropX, -cropY);
+    previewCtx.drawImage(video, 0, 0);
+    previewCtx.setTransform(1, 0, 0, 1, 0, 0);
   } else {
     previewCtx.drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
   }
