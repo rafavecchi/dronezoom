@@ -125,6 +125,23 @@ interface BlobState {
   vy: number;
   h: number; // ds px
   resHistory: number[];
+  miss: number;
+}
+
+/**
+ * The camera moved: carry the prediction (and velocity) with it. During
+ * a whip pan the rider's frame position moves with the camera, not with
+ * his own ground motion — without this, every fast pan loses the track.
+ */
+function carryByCamera(state: BlobState, M: Affine) {
+  const ax = state.x * DS;
+  const ay = state.y * DS;
+  state.x = (M[0] * ax + M[1] * ay + M[2]) / DS;
+  state.y = (M[3] * ax + M[4] * ay + M[5]) / DS;
+  const vx = M[0] * state.vx + M[1] * state.vy;
+  const vy = M[3] * state.vx + M[4] * state.vy;
+  state.vx = vx;
+  state.vy = vy;
 }
 
 function blobStep(
@@ -157,10 +174,12 @@ function blobStep(
   let best = -Infinity;
   let bx = 0;
   let by = 0;
-  const inv2s2 = 1 / (2 * SEARCH * SEARCH);
+  // search widens with the miss streak so a lost track can re-acquire
+  const sEff = Math.min(SEARCH * (1 + state.miss / 15), 150);
+  const inv2s2 = 1 / (2 * sEff * sEff);
   for (let y = m; y < BH - m; y++) {
     const dy2 = (y - py) * (y - py);
-    if (dy2 > 9 * SEARCH * SEARCH) continue;
+    if (dy2 > 9 * sEff * sEff) continue;
     for (let x = m; x < BW - m; x++) {
       const resp = small[y * BW + x] - 0.8 * large[y * BW + x];
       const d2 = (x - px) * (x - px) + dy2;
@@ -194,6 +213,7 @@ function blobStep(
     state.vy = 0.6 * state.vy + 0.4 * (ny - state.y);
     state.x = nx;
     state.y = ny;
+    state.miss = 0;
     // height: vertical extent of diff > 0.4*peak in a column band
     const peakV = diff[by * BW + bx];
     let hh = 0;
@@ -206,6 +226,7 @@ function blobStep(
     }
     state.h = Math.max(3, hh);
   } else {
+    state.miss++;
     state.vx *= 0.9;
     state.vy *= 0.9;
     state.x = Math.min(Math.max(state.x + state.vx, 0), BW - 1);
@@ -294,6 +315,7 @@ export async function runAnalysis(
       vy: 0,
       h: 12,
       resHistory: [],
+      miss: 0,
     };
     let prevGray: Float32Array | null = null;
     let prevSpec: ReturnType<typeof frameSpectra> | null = null;
@@ -315,6 +337,7 @@ export async function runAnalysis(
           dty: Mf[5] * toSrc,
           quality,
         };
+        carryByCamera(blob, M);
         const diff = alignedDiffDs(prevGray, gray, M);
         const { found } = blobStep(blob, diff);
         if (found) blobHits++;

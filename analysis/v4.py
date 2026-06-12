@@ -77,6 +77,7 @@ def track_blobs(clip, A, yolo_samples):
     vx = vy = 0.0
     SEARCH = 80
     res_hist = []
+    miss = 0
     out_t, out_x, out_y, out_h, out_q = [], [], [], [], []
     i = 0
     while True:
@@ -87,6 +88,11 @@ def track_blobs(clip, A, yolo_samples):
         g = cv2.cvtColor(cv2.resize(frame, (AW, AH)), cv2.COLOR_BGR2GRAY).astype(np.float32)
         if prev is not None:
             M = Ms[min(i - 1, len(Ms) - 1)]
+            # the camera moved: carry the prediction (and velocity) with
+            # it — during a whip pan the rider's frame position moves with
+            # the camera, not with his own ground motion
+            px, py = M[0, 0] * px + M[0, 1] * py + M[0, 2], M[1, 0] * px + M[1, 1] * py + M[1, 2]
+            vx, vy = M[0, 0] * vx + M[0, 1] * vy, M[1, 0] * vx + M[1, 1] * vy
             aligned = cv2.warpAffine(prev, M, (AW, AH))
             diff = cv2.absdiff(g, aligned)
             m = 8
@@ -105,9 +111,11 @@ def track_blobs(clip, A, yolo_samples):
             resp = cv2.GaussianBlur(diff, (0, 0), 3) - 0.8 * cv2.GaussianBlur(diff, (0, 0), 12)
             cx_pred = min(max(px + vx, 0), AW - 1)
             cy_pred = min(max(py + vy, 0), AH - 1)
-            # proximity weight
+            # proximity weight; search widens with the miss streak so a
+            # lost track can re-acquire
+            s_eff = min(SEARCH * (1 + miss / 15), 300)
             yy, xx = np.mgrid[0:AH, 0:AW]
-            prox = np.exp(-((xx - cx_pred) ** 2 + (yy - cy_pred) ** 2) / (2 * SEARCH**2))
+            prox = np.exp(-((xx - cx_pred) ** 2 + (yy - cy_pred) ** 2) / (2 * s_eff**2))
             score = resp * prox
             k = int(np.argmax(score))
             bx, by = k % AW, k // AW
@@ -127,11 +135,13 @@ def track_blobs(clip, A, yolo_samples):
                 vx = 0.6 * vx + 0.4 * (bx - px)
                 vy = 0.6 * vy + 0.4 * (by - py)
                 px, py = bx, by
+                miss = 0
                 # height: extent of diff > half peak around blob
                 col = diff[max(int(by) - 20, 0) : int(by) + 20, max(int(bx) - 4, 0) : int(bx) + 4]
                 hh = max(6.0, float((col > diff[int(by), int(bx)] * 0.4).sum(axis=0).max()))
                 out_h.append(hh * sy)
             else:
+                miss += 1
                 vx *= 0.9
                 vy *= 0.9
                 px = min(max(px + vx, 0), AW)
