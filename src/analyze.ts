@@ -302,10 +302,41 @@ export async function runAnalysis(
   const blobFound = new Uint8Array(frames);
   const samples: Sample[] = [];
 
+  // Pause cleanly while the tab is hidden (mobile freezes background
+  // pages); resume from the same frame when it returns.
+  const waitVisible = () =>
+    document.hidden
+      ? new Promise<void>((resolve) => {
+          const h = () => {
+            if (!document.hidden) {
+              document.removeEventListener('visibilitychange', h);
+              resolve();
+            }
+          };
+          document.addEventListener('visibilitychange', h);
+        })
+      : Promise.resolve();
+
   const seekTo = (t: number) =>
     new Promise<void>((resolve) => {
-      video.addEventListener('seeked', () => resolve(), { once: true });
-      video.currentTime = Math.min(t, Math.max(0, video.duration - 0.001));
+      const target = Math.min(t, Math.max(0, video.duration - 0.001));
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener('seeked', finish);
+        clearInterval(nudge);
+        resolve();
+      };
+      video.addEventListener('seeked', finish);
+      // A seek issued right as the page freezes can lose its event —
+      // re-issue after waking until it lands.
+      const nudge = setInterval(() => {
+        if (document.hidden) return;
+        if (Math.abs(video.currentTime - target) < 0.02 && video.readyState >= 2) finish();
+        else video.currentTime = target;
+      }, 3000);
+      video.currentTime = target;
     });
 
   let done = 0;
@@ -326,6 +357,7 @@ export async function runAnalysis(
     let prevGray: Float32Array | null = null;
     let prevSpec: ReturnType<typeof frameSpectra> | null = null;
     for (let k = from; step > 0 ? k <= to : k >= to; k += step) {
+      await waitVisible();
       await seekTo((k + 0.5) / fps);
       const gray = grabGray(video);
       const spec = frameSpectra(gray);

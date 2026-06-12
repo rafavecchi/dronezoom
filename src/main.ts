@@ -283,10 +283,60 @@ function renderLoop() {
 
 function seekTo(t: number): Promise<void> {
   return new Promise((resolve) => {
-    video.addEventListener('seeked', () => resolve(), { once: true });
-    video.currentTime = t;
+    const wait = document.hidden
+      ? new Promise<void>((r) => {
+          const h = () => {
+            if (!document.hidden) {
+              document.removeEventListener('visibilitychange', h);
+              r();
+            }
+          };
+          document.addEventListener('visibilitychange', h);
+        })
+      : Promise.resolve();
+    void wait.then(() => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener('seeked', finish);
+        clearInterval(nudge);
+        resolve();
+      };
+      video.addEventListener('seeked', finish);
+      const nudge = setInterval(() => {
+        if (document.hidden) return;
+        if (Math.abs(video.currentTime - t) < 0.02 && video.readyState >= 2) finish();
+        else video.currentTime = t;
+      }, 3000);
+      video.currentTime = t;
+    });
   });
 }
+
+// Keep the screen awake during long passes — a locked phone freezes the
+// page and stalls analysis/export.
+let wakeLock: { release(): Promise<void> } | null = null;
+async function acquireWakeLock() {
+  try {
+    const wl = (
+      navigator as unknown as {
+        wakeLock?: { request(type: 'screen'): Promise<{ release(): Promise<void> }> };
+      }
+    ).wakeLock;
+    if (wl) wakeLock = await wl.request('screen');
+  } catch {
+    // denied/unsupported — analysis still works, screen may sleep
+  }
+}
+function releaseWakeLock() {
+  void wakeLock?.release().catch(() => undefined);
+  wakeLock = null;
+}
+document.addEventListener('visibilitychange', () => {
+  // wake locks auto-release when the tab hides; re-grab on return
+  if (!document.hidden && analyzing) void acquireWakeLock();
+});
 
 let presentLoopStarted = false;
 function startPresentLoop() {
@@ -326,11 +376,14 @@ async function analyze() {
   progressBar.hidden = false;
   progressBar.value = 0;
   const startedAt = performance.now();
+  await acquireWakeLock();
 
   try {
     setStatus('Probing frame rate…');
     const fps = await probeFps(video);
-    setStatus(`Analyzing every frame @ ${fps}fps — motion, shake and rider track in one pass…`);
+    setStatus(
+      `Analyzing every frame @ ${fps}fps — screen stays awake; if you switch apps it pauses and resumes when you return.`,
+    );
     let lastDraw = 0;
     analysis = await runAnalysis(video, seedPoint, seedT, fps, (done, total, roi, blob) => {
       progressBar.value = done / total;
@@ -351,6 +404,7 @@ async function analyze() {
   const secs = ((performance.now() - startedAt) / 1000).toFixed(0);
   progressBar.hidden = true;
   analyzing = false;
+  releaseWakeLock();
   analyzeBtn.disabled = false;
   playBtn.disabled = false;
   if (!analysis) return;
@@ -466,6 +520,7 @@ exportBtn.addEventListener('click', async () => {
   playBtn.textContent = 'Play';
   progressBar.hidden = false;
   progressBar.value = 0;
+  await acquireWakeLock();
 
   const fps = analysis.fps;
   const aspect = video.videoWidth / video.videoHeight;
@@ -505,6 +560,7 @@ exportBtn.addEventListener('click', async () => {
     setStatus(`Export failed: ${e}`, true);
   } finally {
     analyzing = false;
+    releaseWakeLock();
     analyzeBtn.disabled = false;
     playBtn.disabled = false;
     exportBtn.disabled = false;
