@@ -52,6 +52,18 @@ def handle(svc, folders, item):
 
 
 def main():
+    # single-instance lock: duplicate workers double-process jobs. The
+    # socket releases automatically if the process dies.
+    import socket
+
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", 47821))
+        lock.listen(1)
+    except OSError:
+        print("another DroneZoom worker is already running — exiting")
+        return
+
     log("worker starting")
     svc = None
     folders = None
