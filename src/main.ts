@@ -1,5 +1,6 @@
 import { initDetector, detectPersons } from './detect';
 import { buildCropPath, cropAt, type Sample, type CropKey } from './path';
+import { estimateCameraPath, cameraAt, type CameraPath } from './stabilize';
 import { Tracker, type Point } from './tracker';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -13,6 +14,7 @@ const padValue = $<HTMLSpanElement>('padValue');
 const smoothSlider = $<HTMLInputElement>('smoothSlider');
 const smoothValue = $<HTMLSpanElement>('smoothValue');
 const showBoxes = $<HTMLInputElement>('showBoxes');
+const stabilizeChk = $<HTMLInputElement>('stabilizeChk');
 const statusEl = $<HTMLParagraphElement>('status');
 const scrubBar = $<HTMLInputElement>('scrubBar');
 const progressBar = $<HTMLProgressElement>('progressBar');
@@ -34,6 +36,15 @@ let seedPoint: Point | null = null;
 let seedT = 0;
 let seedDirty = false;
 let scrubbing = false;
+let camPath: CameraPath | null = null;
+
+function clampNum(v: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, v));
+}
+
+function camOffset(t: number): { x: number; y: number } {
+  return stabilizeChk.checked && camPath ? cameraAt(camPath, t) : { x: 0, y: 0 };
+}
 
 function setStatus(msg: string, isError = false) {
   statusEl.textContent = msg;
@@ -51,7 +62,15 @@ function pathOptions() {
 
 function rebuildPath() {
   if (samples.length === 0) return;
-  cropPath = buildCropPath(samples, video.videoWidth, video.videoHeight, pathOptions());
+  // Move detections into stabilized "world" coordinates before smoothing:
+  // shake is removed from the subject signal, and the renderer adds each
+  // frame's camera offset back so it cancels exactly.
+  const worldSamples = samples.map((s) => {
+    if (!s.box) return s;
+    const cam = camOffset(s.t);
+    return { t: s.t, box: { ...s.box, cx: s.box.cx - cam.x, cy: s.box.cy - cam.y } };
+  });
+  cropPath = buildCropPath(worldSamples, video.videoWidth, video.videoHeight, pathOptions());
   drawFrame();
 }
 
@@ -84,6 +103,13 @@ function drawFrame() {
   originalCtx.drawImage(video, 0, 0, ow, oh);
 
   const crop = cropPath.length ? cropAt(cropPath, t) : null;
+  let cropX = 0;
+  let cropY = 0;
+  if (crop) {
+    const cam = camOffset(t);
+    cropX = clampNum(crop.cx + cam.x, crop.cropW / 2, video.videoWidth - crop.cropW / 2);
+    cropY = clampNum(crop.cy + cam.y, crop.cropH / 2, video.videoHeight - crop.cropH / 2);
+  }
 
   if (showBoxes.checked) {
     const box = nearestSample(t)?.box;
@@ -101,8 +127,8 @@ function drawFrame() {
       originalCtx.strokeStyle = '#35c4a2';
       originalCtx.lineWidth = 2;
       originalCtx.strokeRect(
-        (crop.cx - crop.cropW / 2) * scale,
-        (crop.cy - crop.cropH / 2) * scale,
+        (cropX - crop.cropW / 2) * scale,
+        (cropY - crop.cropH / 2) * scale,
         crop.cropW * scale,
         crop.cropH * scale,
       );
@@ -126,8 +152,8 @@ function drawFrame() {
   if (crop) {
     previewCtx.drawImage(
       video,
-      crop.cx - crop.cropW / 2,
-      crop.cy - crop.cropH / 2,
+      cropX - crop.cropW / 2,
+      cropY - crop.cropH / 2,
       crop.cropW,
       crop.cropH,
       0,
@@ -221,6 +247,19 @@ async function analyze() {
     samples = [];
   }
 
+  if (samples.length > 0) {
+    setStatus('Measuring per-frame camera shake (plays the clip through once)…');
+    progressBar.value = 0;
+    try {
+      camPath = await estimateCameraPath(video, (t) => {
+        progressBar.value = t / duration;
+      });
+    } catch (e) {
+      camPath = null;
+      setStatus(`Shake measurement unavailable (${e}) — continuing without stabilization.`, true);
+    }
+  }
+
   const secs = ((performance.now() - startedAt) / 1000).toFixed(1);
   progressBar.hidden = true;
   analyzing = false;
@@ -232,8 +271,9 @@ async function analyze() {
   await seekTo(0);
   drawFrame();
   setStatus(
-    `Done in ${secs}s — rider in ${detected}/${samples.length} samples (${roiHits} via zoomed re-detect). ` +
-      `Scrub through it; if tracking drifts, click yourself at that moment and re-Analyze.`,
+    `Done in ${secs}s — rider in ${detected}/${samples.length} samples (${roiHits} via zoomed re-detect)` +
+      `${camPath ? ', shake measured per frame' : ''}. ` +
+      `Toggle "stabilize" to compare; if tracking drifts, click yourself at that moment and re-Analyze.`,
   );
 }
 
@@ -243,6 +283,7 @@ fileInput.addEventListener('change', () => {
   video.src = URL.createObjectURL(file);
   samples = [];
   cropPath = [];
+  camPath = null;
   seedPoint = null;
   seedDirty = false;
   video.addEventListener(
@@ -313,6 +354,9 @@ smoothSlider.addEventListener('input', () => {
   if (!analyzing) rebuildPath();
 });
 showBoxes.addEventListener('change', drawFrame);
+stabilizeChk.addEventListener('change', () => {
+  if (!analyzing) rebuildPath();
+});
 
 initDetector()
   .then((ep) => setStatus(`Detector ready (${ep === 'webgpu' ? 'WebGPU 🚀' : 'WASM/CPU — slower'}). Pick a clip.`))

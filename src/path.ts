@@ -73,16 +73,12 @@ export function buildCropPath(
   sCx = leash(sCx, cx, limX);
   sCy = leash(sCy, cy, limY);
 
+  // No frame-boundary clamp here: the path may be in stabilized "world"
+  // coordinates — the renderer clamps after adding the per-frame camera
+  // offset back.
   return samples.map((s, i) => {
     const cropH = cropHs[i];
-    const cropW = cropH * aspect;
-    return {
-      t: s.t,
-      cx: clamp(sCx[i], cropW / 2, srcW - cropW / 2),
-      cy: clamp(sCy[i], cropH / 2, srcH - cropH / 2),
-      cropW,
-      cropH,
-    };
+    return { t: s.t, cx: sCx[i], cy: sCy[i], cropW: cropH * aspect, cropH };
   });
 }
 
