@@ -49,15 +49,32 @@ export function buildCropPath(
   const ph = medianFilter(fillGaps(samples.map((s) => s.box?.h ?? null)));
 
   const sigma = opts.smoothSigmaSec / opts.sampleInterval;
-  const sCx = gaussianSmooth(cx, sigma);
-  const sCy = gaussianSmooth(cy, sigma);
   const sPh = gaussianSmooth(ph, sigma * 2);
 
   const minCropH = srcH / opts.maxZoom;
   const aspect = srcW / srcH;
+  const cropHs = sPh.map((h) => clamp(h * opts.padFactor, minCropH, srcH));
+
+  // "As smooth as possible, subject to the rider staying inside the leash
+  // zone": pure Gaussian smoothing lags behind abrupt drone swings and lets
+  // the subject slide to the crop edge. Alternate smoothing with a clamp
+  // back into the leash window (each round smoothing less), then clamp hard
+  // — smooth when the camera is steady, responsive exactly when it swings.
+  const LEASH = 0.45; // subject stays within this fraction of crop half-size
+  const limX = (i: number) => (cropHs[i] * aspect * LEASH) / 2;
+  const limY = (i: number) => (cropHs[i] * LEASH) / 2;
+  let sCx = gaussianSmooth(cx, sigma);
+  let sCy = gaussianSmooth(cy, sigma);
+  for (let iter = 0; iter < 6; iter++) {
+    const s = sigma * Math.pow(0.55, iter + 1);
+    sCx = gaussianSmooth(leash(sCx, cx, limX), s);
+    sCy = gaussianSmooth(leash(sCy, cy, limY), s);
+  }
+  sCx = leash(sCx, cx, limX);
+  sCy = leash(sCy, cy, limY);
 
   return samples.map((s, i) => {
-    const cropH = clamp(sPh[i] * opts.padFactor, minCropH, srcH);
+    const cropH = cropHs[i];
     const cropW = cropH * aspect;
     return {
       t: s.t,
@@ -67,6 +84,12 @@ export function buildCropPath(
       cropH,
     };
   });
+}
+
+function leash(path: number[], subject: number[], halfWindow: (i: number) => number): number[] {
+  return path.map((v, i) =>
+    clamp(v, subject[i] - halfWindow(i), subject[i] + halfWindow(i)),
+  );
 }
 
 /** Crop window at an arbitrary time, lerped between path keys. */
