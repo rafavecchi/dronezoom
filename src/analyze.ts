@@ -395,16 +395,22 @@ export async function runAnalysis(
         if (!box) box = tracker.match(video, await detectPersons(video, srcW, srcH), t);
         if (box) {
           roiHits++;
-          // The tracker already validated identity (appearance + motion
-          // gates), so snap the blob toward it unconditionally — grass
-          // shimmer and parallax can steal the blob, and a proximity
-          // gate here would block the rescue.
+          // Rescue semantics: when the blob clearly left the rider
+          // (stolen by grass/parallax), snap to the identity-validated
+          // detection; when they agree, only nudge — continuous hard
+          // snapping injects detection-box noise as vertical rocking.
           const bx = box.cx / toSrc / DS;
           const by = box.cy / toSrc / DS;
-          blob.x = 0.3 * blob.x + 0.7 * bx;
-          blob.y = 0.3 * blob.y + 0.7 * by;
+          const d = Math.hypot(bx - blob.x, by - blob.y);
+          if (d > 30) {
+            blob.x = bx;
+            blob.y = by;
+            blob.miss = 0;
+          } else {
+            blob.x = 0.9 * blob.x + 0.1 * bx;
+            blob.y = 0.9 * blob.y + 0.1 * by;
+          }
           blob.h = Math.max(blob.h, box.h / toSrc / DS);
-          blob.miss = 0;
         }
         samples.push({ t, box });
       }

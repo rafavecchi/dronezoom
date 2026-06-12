@@ -95,6 +95,9 @@ def track_blobs(clip, A, yolo_samples):
             vx, vy = M[0, 0] * vx + M[0, 1] * vy, M[1, 0] * vx + M[1, 1] * vy
             aligned = cv2.warpAffine(prev, M, (AW, AH))
             diff = cv2.absdiff(g, aligned)
+            # NOTE: luminance-normalizing the diff (to boost shadowed
+            # movers) was tried and reverted — it amplified shadow noise
+            # and degraded sunny segments 7px -> 113px.
             m = 8
             diff[:m, :] = 0
             diff[-m:, :] = 0
@@ -150,16 +153,21 @@ def track_blobs(clip, A, yolo_samples):
                 px = min(max(px + vx, 0), AW)
                 py = min(max(py + vy, 0), AH)
                 out_h.append(out_h[-1] if out_h else 80.0)
-            # YOLO re-anchor. A strong detection snaps the track back
-            # unconditionally — wind-blown grass and parallax can steal
-            # the blob, and a proximity gate would block the rescue.
-            ys = np.interp(t, yts, yscore)
-            yx, yyc = np.interp(t, yts, ycx) / sx, np.interp(t, yts, ycy) / sy
-            if ys > 0.45:
-                px, py = 0.3 * px + 0.7 * yx, 0.3 * py + 0.7 * yyc
-                miss = 0
-            elif ys > 0.3 and np.hypot(yx - px, yyc - py) < 250:
-                px, py = 0.6 * px + 0.4 * yx, 0.6 * py + 0.4 * yyc
+            # YOLO re-anchor at ACTUAL confident samples only (never the
+            # interpolation between them — it cuts corners through gaps
+            # and carries box noise). Rescue-snap when the blob clearly
+            # left the rider; otherwise the merest nudge.
+            near = np.abs(yts - t) < 0.5 / fps
+            if near.any():
+                j = int(np.argmax(near))
+                if yscore[j] > 0.45:
+                    yx, yyc = ycx[j] / sx, ycy[j] / sy
+                    d = np.hypot(yx - px, yyc - py)
+                    if d > 60:
+                        px, py = yx, yyc
+                        miss = 0
+                    else:
+                        px, py = 0.9 * px + 0.1 * yx, 0.9 * py + 0.1 * yyc
             out_t.append(t)
             out_x.append(px * sx)
             out_y.append(py * sy)
