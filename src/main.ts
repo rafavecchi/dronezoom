@@ -40,6 +40,10 @@ let camPath: CameraPath | null = null;
 // Smoothed roll: the intended slow camera leveling; the residual
 // (instantaneous minus smoothed) is the roll shake we counter-rotate.
 let smoothRoll: number[] = [];
+// Smoothed translation: used to express frame-boundary limits in world
+// coordinates without injecting per-frame jitter into the path.
+let smoothCamX: number[] = [];
+let smoothCamY: number[] = [];
 
 function clampNum(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
@@ -99,22 +103,39 @@ function pathOptions() {
 
 function rebuildPath() {
   if (samples.length === 0) return;
+  const { videoWidth: w, videoHeight: h } = video;
   if (camPath) {
     // Per-frame samples are ~uniformly spaced, so sigma in samples is
     // smoothing seconds divided by the average frame interval.
     const dtAvg =
       camPath.ts.length > 1 ? camPath.ts[camPath.ts.length - 1] / (camPath.ts.length - 1) : 1;
-    smoothRoll = gaussianSmooth(camPath.rs, parseFloat(smoothSlider.value) / dtAvg);
+    const sigma = parseFloat(smoothSlider.value) / dtAvg;
+    smoothRoll = gaussianSmooth(camPath.rs, sigma);
+    smoothCamX = gaussianSmooth(camPath.xs, sigma);
+    smoothCamY = gaussianSmooth(camPath.ys, sigma);
   }
   // Move detections into stabilized "world" coordinates before smoothing:
   // shake is removed from the subject signal, and the renderer applies
   // each frame's camera transform back so it cancels exactly.
   const worldSamples = samples.map((s) => {
     if (!s.box) return s;
-    const w = frameToWorld(s.box.cx, s.box.cy, camOffset(s.t));
-    return { t: s.t, box: { ...s.box, cx: w.x, cy: w.y } };
+    const wpt = frameToWorld(s.box.cx, s.box.cy, camOffset(s.t));
+    return { t: s.t, box: { ...s.box, cx: wpt.x, cy: wpt.y } };
   });
-  cropPath = buildCropPath(worldSamples, video.videoWidth, video.videoHeight, pathOptions());
+  const useCam = stabilizeChk.checked && camPath !== null;
+  cropPath = buildCropPath(worldSamples, w, h, {
+    ...pathOptions(),
+    bounds: (t, cropW, cropH) => {
+      const cx = useCam ? lerpSeries(camPath!.ts, smoothCamX, t) : 0;
+      const cy = useCam ? lerpSeries(camPath!.ts, smoothCamY, t) : 0;
+      return {
+        loX: cropW / 2 - cx,
+        hiX: w - cropW / 2 - cx,
+        loY: cropH / 2 - cy,
+        hiY: h - cropH / 2 - cy,
+      };
+    },
+  });
   drawFrame();
 }
 

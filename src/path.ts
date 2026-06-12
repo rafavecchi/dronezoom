@@ -13,6 +13,13 @@ export interface CropKey {
   cropH: number;
 }
 
+export interface PathBounds {
+  loX: number;
+  hiX: number;
+  loY: number;
+  hiY: number;
+}
+
 export interface PathOptions {
   /** Crop height as a multiple of the detected rider height. */
   padFactor: number;
@@ -22,6 +29,13 @@ export interface PathOptions {
   maxZoom: number;
   /** Spacing between samples, in seconds. */
   sampleInterval: number;
+  /**
+   * Allowed range for the (world-coordinate) crop center at time t. Lets
+   * the smoothed path absorb frame-boundary limits in advance, instead of
+   * the renderer hard-clamping there — which clips the per-frame shake
+   * correction and lets shake through right at the edges.
+   */
+  bounds?: (t: number, cropW: number, cropH: number) => PathBounds;
 }
 
 /**
@@ -60,18 +74,38 @@ export function buildCropPath(
   // the subject slide to the crop edge. Alternate smoothing with a clamp
   // back into the leash window (each round smoothing less), then clamp hard
   // — smooth when the camera is steady, responsive exactly when it swings.
-  const LEASH = 0.45; // subject stays within this fraction of crop half-size
-  const limX = (i: number) => (cropHs[i] * aspect * LEASH) / 2;
-  const limY = (i: number) => (cropHs[i] * LEASH) / 2;
+  // Vertical leash is tighter: riders move vertically in fast bursts
+  // (drops, terrain) and the 16:9 crop has less vertical headroom.
+  const LEASH_X = 0.45;
+  const LEASH_Y = 0.35;
+  const limX = (i: number) => (cropHs[i] * aspect * LEASH_X) / 2;
+  const limY = (i: number) => (cropHs[i] * LEASH_Y) / 2;
+
+  const boundsArr = samples.map(
+    (s, i) => opts.bounds?.(s.t, cropHs[i] * aspect, cropHs[i]) ?? null,
+  );
+  const inBoundsX = (arr: number[]) =>
+    arr.map((v, i) => {
+      const b = boundsArr[i];
+      if (!b) return v;
+      return b.hiX < b.loX ? (b.loX + b.hiX) / 2 : clamp(v, b.loX, b.hiX);
+    });
+  const inBoundsY = (arr: number[]) =>
+    arr.map((v, i) => {
+      const b = boundsArr[i];
+      if (!b) return v;
+      return b.hiY < b.loY ? (b.loY + b.hiY) / 2 : clamp(v, b.loY, b.hiY);
+    });
+
   let sCx = gaussianSmooth(cx, sigma);
   let sCy = gaussianSmooth(cy, sigma);
   for (let iter = 0; iter < 6; iter++) {
     const s = sigma * Math.pow(0.55, iter + 1);
-    sCx = gaussianSmooth(leash(sCx, cx, limX), s);
-    sCy = gaussianSmooth(leash(sCy, cy, limY), s);
+    sCx = gaussianSmooth(inBoundsX(leash(sCx, cx, limX)), s);
+    sCy = gaussianSmooth(inBoundsY(leash(sCy, cy, limY)), s);
   }
-  sCx = leash(sCx, cx, limX);
-  sCy = leash(sCy, cy, limY);
+  sCx = inBoundsX(leash(sCx, cx, limX));
+  sCy = inBoundsY(leash(sCy, cy, limY));
 
   // No frame-boundary clamp here: the path may be in stabilized "world"
   // coordinates — the renderer clamps after adding the per-frame camera
