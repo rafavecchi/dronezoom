@@ -3,3 +3,5 @@ dist/
 *.local
 *.mp4
 *.MP4
+analysis/*.jpg
+analysis/cache/
