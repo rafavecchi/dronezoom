@@ -395,13 +395,16 @@ export async function runAnalysis(
         if (!box) box = tracker.match(video, await detectPersons(video, srcW, srcH), t);
         if (box) {
           roiHits++;
+          // The tracker already validated identity (appearance + motion
+          // gates), so snap the blob toward it unconditionally — grass
+          // shimmer and parallax can steal the blob, and a proximity
+          // gate here would block the rescue.
           const bx = box.cx / toSrc / DS;
           const by = box.cy / toSrc / DS;
-          if (Math.hypot(bx - blob.x, by - blob.y) < 100 / DS) {
-            blob.x = 0.7 * blob.x + 0.3 * bx;
-            blob.y = 0.7 * blob.y + 0.3 * by;
-            blob.h = Math.max(blob.h, box.h / toSrc / DS);
-          }
+          blob.x = 0.3 * blob.x + 0.7 * bx;
+          blob.y = 0.3 * blob.y + 0.7 * by;
+          blob.h = Math.max(blob.h, box.h / toSrc / DS);
+          blob.miss = 0;
         }
         samples.push({ t, box });
       }

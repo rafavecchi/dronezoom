@@ -150,12 +150,16 @@ def track_blobs(clip, A, yolo_samples):
                 px = min(max(px + vx, 0), AW)
                 py = min(max(py + vy, 0), AH)
                 out_h.append(out_h[-1] if out_h else 80.0)
-            # YOLO re-anchor
+            # YOLO re-anchor. A strong detection snaps the track back
+            # unconditionally — wind-blown grass and parallax can steal
+            # the blob, and a proximity gate would block the rescue.
             ys = np.interp(t, yts, yscore)
-            if ys > 0.3:
-                yx, yyc = np.interp(t, yts, ycx) / sx, np.interp(t, yts, ycy) / sy
-                if np.hypot(yx - px, yyc - py) < 100:
-                    px, py = 0.7 * px + 0.3 * yx, 0.7 * py + 0.3 * yyc
+            yx, yyc = np.interp(t, yts, ycx) / sx, np.interp(t, yts, ycy) / sy
+            if ys > 0.45:
+                px, py = 0.3 * px + 0.7 * yx, 0.3 * py + 0.7 * yyc
+                miss = 0
+            elif ys > 0.3 and np.hypot(yx - px, yyc - py) < 250:
+                px, py = 0.6 * px + 0.4 * yx, 0.6 * py + 0.4 * yyc
             out_t.append(t)
             out_x.append(px * sx)
             out_y.append(py * sy)
