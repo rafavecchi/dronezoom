@@ -1,3 +1,5 @@
 node_modules/
 dist/
 *.local
+*.mp4
+*.MP4

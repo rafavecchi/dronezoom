@@ -1,4 +1,5 @@
 import { initDetector, detectPersons } from './detect';
+import { exportVideo } from './export';
 import { buildCropPath, cropAt, gaussianSmooth, type Sample, type CropKey } from './path';
 import { estimateCameraPath, lerpSeries, stepSeries, type CameraPath } from './stabilize';
 import { Tracker, type Point } from './tracker';
@@ -8,6 +9,7 @@ const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as 
 const fileInput = $<HTMLInputElement>('fileInput');
 const analyzeBtn = $<HTMLButtonElement>('analyzeBtn');
 const playBtn = $<HTMLButtonElement>('playBtn');
+const exportBtn = $<HTMLButtonElement>('exportBtn');
 const strideSel = $<HTMLSelectElement>('strideSel');
 const padSlider = $<HTMLInputElement>('padSlider');
 const padValue = $<HTMLSpanElement>('padValue');
@@ -182,6 +184,46 @@ function nearestSample(t: number): Sample | undefined {
   return best;
 }
 
+interface CropState {
+  crop: CropKey;
+  x: number;
+  y: number;
+  roll: number;
+}
+
+function cropStateAt(t: number): CropState | null {
+  if (!cropPath.length) return null;
+  const crop = cropAt(cropPath, t);
+  const cam = camOffset(t);
+  const q = worldToFrame(crop.cx, crop.cy, cam);
+  return {
+    crop,
+    x: clampNum(q.x, crop.cropW / 2, video.videoWidth - crop.cropW / 2),
+    y: clampNum(q.y, crop.cropH / 2, video.videoHeight - crop.cropH / 2),
+    roll: cam.r - smoothRollAt(t),
+  };
+}
+
+// The single source of truth for the output image — used by both the
+// live preview and the exporter.
+function renderView(c2: CanvasRenderingContext2D, outW: number, outH: number, t: number) {
+  const st = cropStateAt(t);
+  if (!st) {
+    c2.drawImage(video, 0, 0, outW, outH);
+    return;
+  }
+  // Sample the source rotated by the inverse roll residual about the
+  // crop center, so roll shake cancels in the output.
+  const k = outW / st.crop.cropW;
+  c2.setTransform(1, 0, 0, 1, 0, 0);
+  c2.translate(outW / 2, outH / 2);
+  c2.scale(k, k);
+  c2.rotate(-st.roll);
+  c2.translate(-st.x, -st.y);
+  c2.drawImage(video, 0, 0);
+  c2.setTransform(1, 0, 0, 1, 0, 0);
+}
+
 function drawFrame() {
   if (!video.videoWidth) return;
   const t = displayT ?? video.currentTime;
@@ -191,17 +233,7 @@ function drawFrame() {
 
   originalCtx.drawImage(video, 0, 0, ow, oh);
 
-  const crop = cropPath.length ? cropAt(cropPath, t) : null;
-  let cropX = 0;
-  let cropY = 0;
-  let rollResidual = 0;
-  if (crop) {
-    const cam = camOffset(t);
-    const q = worldToFrame(crop.cx, crop.cy, cam);
-    cropX = clampNum(q.x, crop.cropW / 2, video.videoWidth - crop.cropW / 2);
-    cropY = clampNum(q.y, crop.cropH / 2, video.videoHeight - crop.cropH / 2);
-    rollResidual = cam.r - smoothRollAt(t);
-  }
+  const st = cropStateAt(t);
 
   if (showBoxes.checked) {
     const box = nearestSample(t)?.box;
@@ -215,14 +247,14 @@ function drawFrame() {
         box.h * scale,
       );
     }
-    if (crop) {
+    if (st) {
       originalCtx.strokeStyle = '#35c4a2';
       originalCtx.lineWidth = 2;
       originalCtx.strokeRect(
-        (cropX - crop.cropW / 2) * scale,
-        (cropY - crop.cropH / 2) * scale,
-        crop.cropW * scale,
-        crop.cropH * scale,
+        (st.x - st.crop.cropW / 2) * scale,
+        (st.y - st.crop.cropH / 2) * scale,
+        st.crop.cropW * scale,
+        st.crop.cropH * scale,
       );
     }
   }
@@ -241,20 +273,7 @@ function drawFrame() {
     originalCtx.stroke();
   }
 
-  if (crop) {
-    // Sample the source rotated by the inverse roll residual about the
-    // crop center, so roll shake cancels in the output.
-    const k = previewCanvas.width / crop.cropW;
-    previewCtx.setTransform(1, 0, 0, 1, 0, 0);
-    previewCtx.translate(previewCanvas.width / 2, previewCanvas.height / 2);
-    previewCtx.scale(k, k);
-    previewCtx.rotate(-rollResidual);
-    previewCtx.translate(-cropX, -cropY);
-    previewCtx.drawImage(video, 0, 0);
-    previewCtx.setTransform(1, 0, 0, 1, 0, 0);
-  } else {
-    previewCtx.drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
-  }
+  renderView(previewCtx, previewCanvas.width, previewCanvas.height, t);
 }
 
 function renderLoop() {
@@ -396,6 +415,7 @@ async function analyze() {
   analyzeBtn.disabled = false;
   playBtn.disabled = false;
   if (samples.length === 0) return;
+  exportBtn.disabled = false;
 
   rebuildPath();
   await seekTo(0);
@@ -420,6 +440,7 @@ fileInput.addEventListener('change', () => {
   seedPoint = null;
   seedDirty = false;
   displayT = null;
+  exportBtn.disabled = true;
   video.addEventListener(
     'loadedmetadata',
     () => {
@@ -463,6 +484,71 @@ scrubBar.addEventListener('input', () => {
 });
 scrubBar.addEventListener('pointerdown', () => (scrubbing = true));
 window.addEventListener('pointerup', () => (scrubbing = false));
+
+function estimateFps(): number {
+  if (!camPath || camPath.ts.length < 10) return 30;
+  let minGap = Infinity;
+  for (let i = 1; i < camPath.ts.length; i++) {
+    const gap = camPath.ts[i] - camPath.ts[i - 1];
+    if (gap > 1e-4) minGap = Math.min(minGap, gap);
+  }
+  const raw = 1 / minGap;
+  const common = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60];
+  let best = 30;
+  for (const f of common) if (Math.abs(f - raw) < Math.abs(best - raw)) best = f;
+  return best;
+}
+
+exportBtn.addEventListener('click', async () => {
+  if (analyzing || cropPath.length === 0) return;
+  analyzing = true; // blocks slider rebuilds and scrub during export
+  analyzeBtn.disabled = true;
+  playBtn.disabled = true;
+  exportBtn.disabled = true;
+  video.pause();
+  playBtn.textContent = 'Play';
+  progressBar.hidden = false;
+  progressBar.value = 0;
+
+  const fps = estimateFps();
+  const aspect = video.videoWidth / video.videoHeight;
+  const outW = Math.min(1920, video.videoWidth);
+  const outH = Math.round(outW / aspect / 2) * 2;
+  const startedAt = performance.now();
+
+  try {
+    const blob = await exportVideo({
+      video,
+      fps,
+      outW,
+      outH,
+      render: renderView,
+      seekTo,
+      onProgress: (frac) => {
+        progressBar.value = frac;
+        if (Math.round(frac * 100) % 5 === 0) {
+          setStatus(`Exporting… ${(frac * 100).toFixed(0)}% (${outW}×${outH} @ ${fps}fps)`);
+        }
+      },
+    });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'dronezoom-export.mp4';
+    a.click();
+    const secs = ((performance.now() - startedAt) / 1000).toFixed(0);
+    setStatus(
+      `Exported ${(blob.size / 1e6).toFixed(1)} MB in ${secs}s (${outW}×${outH} @ ${fps}fps) — check your downloads.`,
+    );
+  } catch (e) {
+    setStatus(`Export failed: ${e}`, true);
+  } finally {
+    analyzing = false;
+    analyzeBtn.disabled = false;
+    playBtn.disabled = false;
+    exportBtn.disabled = false;
+    progressBar.hidden = true;
+  }
+});
 
 analyzeBtn.addEventListener('click', () => void analyze());
 
