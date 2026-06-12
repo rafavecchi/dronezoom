@@ -1,8 +1,9 @@
-import { initDetector, detectPersons } from './detect';
+import { runAnalysis, probeFps, type AnalysisResult } from './analyze';
+import { initDetector } from './detect';
 import { exportVideo } from './export';
+import { apply, buildResiduals, decompose, IDENTITY, invert, type Affine } from './motion';
 import { buildCropPath, cropAt, gaussianSmooth, type Sample, type CropKey } from './path';
-import { estimateCameraPath, lerpSeries, stepSeries, type CameraPath } from './stabilize';
-import { Tracker, type Point } from './tracker';
+import type { Point } from './tracker';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -29,8 +30,11 @@ const previewCtx = previewCanvas.getContext('2d')!;
 const MAX_ZOOM = 4;
 const PREVIEW_MAX_W = 1280;
 const ORIGINAL_MAX_W = 640;
+const SAMPLE_DT = 0.2;
 
-let samples: Sample[] = [];
+let analysis: AnalysisResult | null = null;
+let Ds: Affine[] = [];
+let samples: Sample[] = []; // YOLO samples, overlay only
 let cropPath: CropKey[] = [];
 let analyzing = false;
 let rafHandle = 0;
@@ -38,66 +42,12 @@ let seedPoint: Point | null = null;
 let seedT = 0;
 let seedDirty = false;
 let scrubbing = false;
-let camPath: CameraPath | null = null;
-// mediaTime of the actually-presented video frame. video.currentTime is
-// the playback head and can lead the displayed frame by up to a frame —
-// applying a per-frame shake correction at the wrong frame *adds* jitter
-// instead of canceling it.
+// mediaTime of the actually-presented frame; video.currentTime can lead
+// the displayed frame, which would misapply per-frame corrections.
 let displayT: number | null = null;
-// Smoothed roll: the intended slow camera leveling; the residual
-// (instantaneous minus smoothed) is the roll shake we counter-rotate.
-let smoothRoll: number[] = [];
-// Smoothed translation: used to express frame-boundary limits in world
-// coordinates without injecting per-frame jitter into the path.
-let smoothCamX: number[] = [];
-let smoothCamY: number[] = [];
 
 function clampNum(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
-}
-
-interface Cam {
-  x: number;
-  y: number;
-  r: number;
-}
-
-function camOffset(t: number): Cam {
-  if (!stabilizeChk.checked || !camPath) return { x: 0, y: 0, r: 0 };
-  // Step lookup: a correction belongs to exactly one frame.
-  return {
-    x: stepSeries(camPath.ts, camPath.xs, t),
-    y: stepSeries(camPath.ts, camPath.ys, t),
-    r: stepSeries(camPath.ts, camPath.rs, t),
-  };
-}
-
-function smoothRollAt(t: number): number {
-  return stabilizeChk.checked && camPath && smoothRoll.length
-    ? lerpSeries(camPath.ts, smoothRoll, t)
-    : 0;
-}
-
-// Frame content = world rotated by cam.r about the frame center, then
-// translated by (cam.x, cam.y).
-function worldToFrame(x: number, y: number, cam: Cam): { x: number; y: number } {
-  const fcx = video.videoWidth / 2;
-  const fcy = video.videoHeight / 2;
-  const cos = Math.cos(cam.r);
-  const sin = Math.sin(cam.r);
-  const dx = x - fcx;
-  const dy = y - fcy;
-  return { x: fcx + cam.x + dx * cos - dy * sin, y: fcy + cam.y + dx * sin + dy * cos };
-}
-
-function frameToWorld(x: number, y: number, cam: Cam): { x: number; y: number } {
-  const fcx = video.videoWidth / 2;
-  const fcy = video.videoHeight / 2;
-  const cos = Math.cos(-cam.r);
-  const sin = Math.sin(-cam.r);
-  const dx = x - fcx - cam.x;
-  const dy = y - fcy - cam.y;
-  return { x: fcx + dx * cos - dy * sin, y: fcy + dx * sin + dy * cos };
 }
 
 function setStatus(msg: string, isError = false) {
@@ -110,69 +60,70 @@ function pathOptions() {
     padFactor: parseFloat(padSlider.value),
     smoothSigmaSec: parseFloat(smoothSlider.value),
     maxZoom: MAX_ZOOM,
-    sampleInterval: parseFloat(strideSel.value),
+    sampleInterval: SAMPLE_DT,
   };
 }
 
+function frameIndexAt(t: number): number {
+  if (!analysis) return 0;
+  return clampNum(Math.floor(t * analysis.fps + 1e-3), 0, analysis.frames - 1);
+}
+
+function residualAt(t: number): Affine {
+  if (!stabilizeChk.checked || Ds.length === 0) return IDENTITY;
+  return Ds[clampNum(frameIndexAt(t), 0, Ds.length - 1)];
+}
+
 function rebuildPath() {
-  if (samples.length === 0) return;
+  if (!analysis) return;
   const { videoWidth: w, videoHeight: h } = video;
-  if (camPath) {
-    // Per-frame samples are ~uniformly spaced, so sigma in samples is
-    // smoothing seconds divided by the average frame interval.
-    const dtAvg =
-      camPath.ts.length > 1 ? camPath.ts[camPath.ts.length - 1] / (camPath.ts.length - 1) : 1;
-    const sigma = parseFloat(smoothSlider.value) / dtAvg;
-    smoothRoll = gaussianSmooth(camPath.rs, sigma);
-    smoothCamX = gaussianSmooth(camPath.xs, sigma);
-    smoothCamY = gaussianSmooth(camPath.ys, sigma);
+  const smoothSec = parseFloat(smoothSlider.value);
+  Ds = buildResiduals(analysis.incs, analysis.fps, smoothSec);
+
+  // Rider track -> "intended camera" coordinates (shake removed), then
+  // downsample to the path grid.
+  const hSmooth = gaussianSmooth(Array.from(analysis.blobH), analysis.fps * 0.5);
+  const trackSamples: Sample[] = [];
+  for (let t = 0; t < analysis.frames / analysis.fps; t += SAMPLE_DT) {
+    const k = frameIndexAt(t);
+    const Di = invert(Ds[clampNum(k, 0, Ds.length - 1)]);
+    const p = apply(Di, analysis.blobX[k], analysis.blobY[k]);
+    trackSamples.push({
+      t,
+      box: {
+        cx: p.x,
+        cy: p.y,
+        w: hSmooth[k] * 0.8,
+        h: clampNum(hSmooth[k] * 1.6, 0.04 * h, 0.3 * h),
+        score: 1,
+      },
+    });
   }
-  // Move detections into stabilized "world" coordinates before smoothing:
-  // shake is removed from the subject signal, and the renderer applies
-  // each frame's camera transform back so it cancels exactly.
-  const worldSamples = samples.map((s) => {
-    if (!s.box) return s;
-    const wpt = frameToWorld(s.box.cx, s.box.cy, camOffset(s.t));
-    return { t: s.t, box: { ...s.box, cx: wpt.x, cy: wpt.y } };
-  });
-  const useCam = stabilizeChk.checked && camPath !== null;
-  // Margin reserved so the renderer's per-frame shake correction (the
-  // difference between instantaneous and smoothed camera) has headroom
-  // before hitting the hard frame-boundary clamp.
+
   const mX = 0.02 * w;
   const mY = 0.025 * h;
+  cropPath = buildCropPath(trackSamples, w, h, {
+    ...pathOptions(),
+    constrain: (_t, cropW, cropH, x, y) => {
+      const loX = cropW / 2 + mX;
+      const hiX = w - cropW / 2 - mX;
+      const loY = cropH / 2 + mY;
+      const hiY = h - cropH / 2 - mY;
+      return {
+        x: hiX < loX ? w / 2 : clampNum(x, loX, hiX),
+        y: hiY < loY ? h / 2 : clampNum(y, loY, hiY),
+      };
+    },
+  });
+
   (window as unknown as Record<string, unknown>).__dz = {
-    samples,
-    camPath,
-    smoothRoll,
-    smoothCamX,
-    smoothCamY,
+    analysis,
+    Ds,
     get cropPath() {
       return cropPath;
     },
     opts: pathOptions(),
   };
-  cropPath = buildCropPath(worldSamples, w, h, {
-    ...pathOptions(),
-    constrain: (t, cropW, cropH, x, y) => {
-      const cam: Cam = useCam
-        ? {
-            x: lerpSeries(camPath!.ts, smoothCamX, t),
-            y: lerpSeries(camPath!.ts, smoothCamY, t),
-            r: lerpSeries(camPath!.ts, smoothRoll, t),
-          }
-        : { x: 0, y: 0, r: 0 };
-      const f = worldToFrame(x, y, cam);
-      const loX = cropW / 2 + mX;
-      const hiX = w - cropW / 2 - mX;
-      const loY = cropH / 2 + mY;
-      const hiY = h - cropH / 2 - mY;
-      const fx = hiX < loX ? w / 2 : clampNum(f.x, loX, hiX);
-      const fy = hiY < loY ? h / 2 : clampNum(f.y, loY, hiY);
-      if (fx === f.x && fy === f.y) return { x, y };
-      return frameToWorld(fx, fy, cam);
-    },
-  });
   drawFrame();
 }
 
@@ -199,19 +150,22 @@ interface CropState {
   crop: CropKey;
   x: number;
   y: number;
-  roll: number;
+  theta: number;
+  scale: number;
 }
 
 function cropStateAt(t: number): CropState | null {
   if (!cropPath.length) return null;
   const crop = cropAt(cropPath, t);
-  const cam = camOffset(t);
-  const q = worldToFrame(crop.cx, crop.cy, cam);
+  const D = residualAt(t);
+  const q = apply(D, crop.cx, crop.cy);
+  const dec = decompose(D);
   return {
     crop,
     x: clampNum(q.x, crop.cropW / 2, video.videoWidth - crop.cropW / 2),
     y: clampNum(q.y, crop.cropH / 2, video.videoHeight - crop.cropH / 2),
-    roll: cam.r - smoothRollAt(t),
+    theta: dec.theta,
+    scale: dec.scale,
   };
 }
 
@@ -223,13 +177,13 @@ function renderView(c2: CanvasRenderingContext2D, outW: number, outH: number, t:
     c2.drawImage(video, 0, 0, outW, outH);
     return;
   }
-  // Sample the source rotated by the inverse roll residual about the
-  // crop center, so roll shake cancels in the output.
-  const k = outW / st.crop.cropW;
+  // Counter-rotate/scale by the residual about the crop center so the
+  // shake cancels in the output.
+  const zoom = outW / (st.crop.cropW * st.scale);
   c2.setTransform(1, 0, 0, 1, 0, 0);
   c2.translate(outW / 2, outH / 2);
-  c2.scale(k, k);
-  c2.rotate(-st.roll);
+  c2.scale(zoom, zoom);
+  c2.rotate(-st.theta);
   c2.translate(-st.x, -st.y);
   c2.drawImage(video, 0, 0);
   c2.setTransform(1, 0, 0, 1, 0, 0);
@@ -258,6 +212,14 @@ function drawFrame() {
         box.h * scale,
       );
     }
+    if (analysis) {
+      const k = frameIndexAt(t);
+      originalCtx.strokeStyle = '#ffd24a';
+      originalCtx.lineWidth = 2;
+      originalCtx.beginPath();
+      originalCtx.arc(analysis.blobX[k] * scale, analysis.blobY[k] * scale, 10, 0, Math.PI * 2);
+      originalCtx.stroke();
+    }
     if (st) {
       originalCtx.strokeStyle = '#35c4a2';
       originalCtx.lineWidth = 2;
@@ -270,7 +232,7 @@ function drawFrame() {
     }
   }
 
-  if (seedPoint && (seedDirty || samples.length === 0)) {
+  if (seedPoint && (seedDirty || !analysis)) {
     const sx = seedPoint.x * scale;
     const sy = seedPoint.y * scale;
     originalCtx.strokeStyle = '#ffd24a';
@@ -302,8 +264,6 @@ function seekTo(t: number): Promise<void> {
   });
 }
 
-// Track the mediaTime of every presented frame. Registered once; the
-// callback chain survives src changes.
 let presentLoopStarted = false;
 function startPresentLoop() {
   if (presentLoopStarted) return;
@@ -333,113 +293,55 @@ async function analyze() {
   seedDirty = false;
   analyzeBtn.disabled = true;
   playBtn.disabled = true;
+  exportBtn.disabled = true;
   video.pause();
-  samples = [];
+  playBtn.textContent = 'Play';
+  analysis = null;
   cropPath = [];
-
-  const { videoWidth: w, videoHeight: h } = video;
-  const interval = parseFloat(strideSel.value);
-  const duration = video.duration;
-  const seedTime = Math.min(seedT, Math.max(0, duration - 0.05));
-  const total = Math.floor(duration / interval) + 1;
+  samples = [];
   progressBar.hidden = false;
+  progressBar.value = 0;
   const startedAt = performance.now();
 
-  let detected = 0;
-  let roiHits = 0;
-  let processed = 0;
-
-  // Zoomed pass first, always: detection boxes on a rider that is only
-  // 10–40px tall in the downscaled full frame are too noisy to frame
-  // with — the ROI makes the rider 4–8x larger for the detector. Full
-  // frame is the fallback for (re)acquisition.
-  const detectAt = async (tracker: Tracker, t: number) => {
-    await seekTo(t);
-    let box = tracker.match(video, await detectPersons(video, w, h, tracker.searchRegion(t)), t);
-    if (box) {
-      roiHits++;
-    } else {
-      box = tracker.match(video, await detectPersons(video, w, h), t);
-    }
-    processed++;
-    if (box) detected++;
-    progressBar.value = processed / total;
-    if (processed % 5 === 0) {
-      setStatus(
-        `Analyzing… ${processed}/${total} samples — rider in ${detected} (${roiHits} via zoomed re-detect)`,
-      );
-      drawFrame();
-    }
-    return box;
-  };
-
   try {
-    // Track outward from the seeded frame in both directions, sharing the
-    // appearance template, so the click anchors identity for the whole clip.
-    const forward = new Tracker({ ...seedPoint }, w, h);
-    const fwdSamples: Sample[] = [];
-    for (let t = seedTime; t < duration; t += interval) {
-      fwdSamples.push({ t, box: await detectAt(forward, t) });
-    }
-    const backward = new Tracker({ ...seedPoint }, w, h, forward.appearance);
-    const bwdSamples: Sample[] = [];
-    for (let t = seedTime - interval; t >= 0; t -= interval) {
-      bwdSamples.push({ t, box: await detectAt(backward, t) });
-    }
-    samples = [...bwdSamples.reverse(), ...fwdSamples];
-  } catch (e) {
-    setStatus(`Detection failed: ${e}`, true);
-    samples = [];
-  }
-
-  if (samples.length > 0) {
-    setStatus('Measuring per-frame camera shake (plays the clip through once)…');
-    progressBar.value = 0;
-    // Rider position over time (frame coords), so the stabilizer can
-    // measure motion in the background around the rider instead of the
-    // parallax-ambiguous full frame.
-    const riderTs: number[] = [];
-    const riderXs: number[] = [];
-    const riderYs: number[] = [];
-    for (const s of samples) {
-      if (s.box) {
-        riderTs.push(s.t);
-        riderXs.push(s.box.cx);
-        riderYs.push(s.box.cy);
+    setStatus('Probing frame rate…');
+    const fps = await probeFps(video);
+    setStatus(`Analyzing every frame @ ${fps}fps — motion, shake and rider track in one pass…`);
+    let lastDraw = 0;
+    analysis = await runAnalysis(video, seedPoint, seedT, fps, (done, total, roi, blob) => {
+      progressBar.value = done / total;
+      if (performance.now() - lastDraw > 500) {
+        lastDraw = performance.now();
+        setStatus(
+          `Analyzing… frame ${done}/${total} — rider blob on ${blob}, YOLO anchors ${roi}`,
+        );
+        drawFrame();
       }
-    }
-    const riderAt = (t: number) =>
-      riderTs.length > 0
-        ? { x: lerpSeries(riderTs, riderXs, t), y: lerpSeries(riderTs, riderYs, t) }
-        : { x: w / 2, y: h / 2 };
-    try {
-      camPath = await estimateCameraPath(video, riderAt, (t) => {
-        progressBar.value = t / duration;
-      });
-    } catch (e) {
-      camPath = null;
-      setStatus(`Shake measurement unavailable (${e}) — continuing without stabilization.`, true);
-    }
+    });
+    samples = analysis.samples;
+  } catch (e) {
+    setStatus(`Analysis failed: ${e}`, true);
+    analysis = null;
   }
 
-  const secs = ((performance.now() - startedAt) / 1000).toFixed(1);
+  const secs = ((performance.now() - startedAt) / 1000).toFixed(0);
   progressBar.hidden = true;
   analyzing = false;
   analyzeBtn.disabled = false;
   playBtn.disabled = false;
-  if (samples.length === 0) return;
+  if (!analysis) return;
   exportBtn.disabled = false;
 
   rebuildPath();
   await seekTo(0);
   drawFrame();
-  const covNote = camPath
-    ? `, shake measured for ${(camPath.coverage * 100).toFixed(0)}% of frames` +
-      (camPath.coverage < 0.85 ? ' (low — uncovered frames stay shaky)' : '')
-    : '';
+  const blobPct = (
+    (Array.from(analysis.blobFound).reduce((s, v) => s + v, 0) / analysis.frames) *
+    100
+  ).toFixed(0);
   setStatus(
-    `Done in ${secs}s — rider in ${detected}/${samples.length} samples (${roiHits} via zoomed re-detect)${covNote}. ` +
-      `Toggle "stabilize" to compare; if tracking drifts, click yourself at that moment and re-Analyze.`,
+    `Done in ${secs}s — rider blob tracked on ${blobPct}% of frames. ` +
+      `Scrub through it; if the yellow circle drifts off you, click yourself there and re-Analyze.`,
   );
 }
 
@@ -447,9 +349,10 @@ fileInput.addEventListener('change', () => {
   const file = fileInput.files?.[0];
   if (!file) return;
   video.src = URL.createObjectURL(file);
+  analysis = null;
   samples = [];
   cropPath = [];
-  camPath = null;
+  Ds = [];
   seedPoint = null;
   seedDirty = false;
   displayT = null;
@@ -498,23 +401,38 @@ scrubBar.addEventListener('input', () => {
 scrubBar.addEventListener('pointerdown', () => (scrubbing = true));
 window.addEventListener('pointerup', () => (scrubbing = false));
 
-function estimateFps(): number {
-  if (!camPath || camPath.ts.length < 10) return 30;
-  let minGap = Infinity;
-  for (let i = 1; i < camPath.ts.length; i++) {
-    const gap = camPath.ts[i] - camPath.ts[i - 1];
-    if (gap > 1e-4) minGap = Math.min(minGap, gap);
+analyzeBtn.addEventListener('click', () => void analyze());
+
+playBtn.addEventListener('click', () => {
+  if (video.paused) {
+    void video.play();
+    playBtn.textContent = 'Pause';
+  } else {
+    video.pause();
+    playBtn.textContent = 'Play';
   }
-  const raw = 1 / minGap;
-  const common = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60];
-  let best = 30;
-  for (const f of common) if (Math.abs(f - raw) < Math.abs(best - raw)) best = f;
-  return best;
-}
+});
+
+video.addEventListener('ended', () => {
+  playBtn.textContent = 'Play';
+});
+
+padSlider.addEventListener('input', () => {
+  padValue.textContent = `${parseFloat(padSlider.value).toFixed(1)}×`;
+  if (!analyzing) rebuildPath();
+});
+smoothSlider.addEventListener('input', () => {
+  smoothValue.textContent = `${parseFloat(smoothSlider.value).toFixed(1)}s`;
+  if (!analyzing) rebuildPath();
+});
+showBoxes.addEventListener('change', drawFrame);
+stabilizeChk.addEventListener('change', () => {
+  if (!analyzing) rebuildPath();
+});
 
 exportBtn.addEventListener('click', async () => {
-  if (analyzing || cropPath.length === 0) return;
-  analyzing = true; // blocks slider rebuilds and scrub during export
+  if (analyzing || cropPath.length === 0 || !analysis) return;
+  analyzing = true; // blocks slider rebuilds and scrubbing during export
   analyzeBtn.disabled = true;
   playBtn.disabled = true;
   exportBtn.disabled = true;
@@ -523,7 +441,7 @@ exportBtn.addEventListener('click', async () => {
   progressBar.hidden = false;
   progressBar.value = 0;
 
-  const fps = estimateFps();
+  const fps = analysis.fps;
   const aspect = video.videoWidth / video.videoHeight;
   const outW = Math.min(1920, video.videoWidth);
   const outH = Math.round(outW / aspect / 2) * 2;
@@ -563,34 +481,9 @@ exportBtn.addEventListener('click', async () => {
   }
 });
 
-analyzeBtn.addEventListener('click', () => void analyze());
-
-playBtn.addEventListener('click', () => {
-  if (video.paused) {
-    void video.play();
-    playBtn.textContent = 'Pause';
-  } else {
-    video.pause();
-    playBtn.textContent = 'Play';
-  }
-});
-
-video.addEventListener('ended', () => {
-  playBtn.textContent = 'Play';
-});
-
-padSlider.addEventListener('input', () => {
-  padValue.textContent = `${parseFloat(padSlider.value).toFixed(1)}×`;
-  if (!analyzing) rebuildPath();
-});
-smoothSlider.addEventListener('input', () => {
-  smoothValue.textContent = `${parseFloat(smoothSlider.value).toFixed(1)}s`;
-  if (!analyzing) rebuildPath();
-});
-showBoxes.addEventListener('change', drawFrame);
-stabilizeChk.addEventListener('change', () => {
-  if (!analyzing) rebuildPath();
-});
+// stride selector is no longer meaningful (analysis is per-frame now)
+strideSel.disabled = true;
+strideSel.title = 'v2 analyzes every frame';
 
 initDetector()
   .then((ep) => setStatus(`Detector ready (${ep === 'webgpu' ? 'WebGPU 🚀' : 'WASM/CPU — slower'}). Pick a clip.`))
