@@ -5,3 +5,6 @@ dist/
 *.MP4
 analysis/*.jpg
 analysis/cache/
+worker/client_secret.json
+worker/token.json
+worker/*.log
