@@ -123,17 +123,30 @@ function rebuildPath() {
     return { t: s.t, box: { ...s.box, cx: wpt.x, cy: wpt.y } };
   });
   const useCam = stabilizeChk.checked && camPath !== null;
+  // Margin reserved so the renderer's per-frame shake correction (the
+  // difference between instantaneous and smoothed camera) has headroom
+  // before hitting the hard frame-boundary clamp.
+  const mX = 0.02 * w;
+  const mY = 0.025 * h;
   cropPath = buildCropPath(worldSamples, w, h, {
     ...pathOptions(),
-    bounds: (t, cropW, cropH) => {
-      const cx = useCam ? lerpSeries(camPath!.ts, smoothCamX, t) : 0;
-      const cy = useCam ? lerpSeries(camPath!.ts, smoothCamY, t) : 0;
-      return {
-        loX: cropW / 2 - cx,
-        hiX: w - cropW / 2 - cx,
-        loY: cropH / 2 - cy,
-        hiY: h - cropH / 2 - cy,
-      };
+    constrain: (t, cropW, cropH, x, y) => {
+      const cam: Cam = useCam
+        ? {
+            x: lerpSeries(camPath!.ts, smoothCamX, t),
+            y: lerpSeries(camPath!.ts, smoothCamY, t),
+            r: lerpSeries(camPath!.ts, smoothRoll, t),
+          }
+        : { x: 0, y: 0, r: 0 };
+      const f = worldToFrame(x, y, cam);
+      const loX = cropW / 2 + mX;
+      const hiX = w - cropW / 2 - mX;
+      const loY = cropH / 2 + mY;
+      const hiY = h - cropH / 2 - mY;
+      const fx = hiX < loX ? w / 2 : clampNum(f.x, loX, hiX);
+      const fy = hiY < loY ? h / 2 : clampNum(f.y, loY, hiY);
+      if (fx === f.x && fy === f.y) return { x, y };
+      return frameToWorld(fx, fy, cam);
     },
   });
   drawFrame();
