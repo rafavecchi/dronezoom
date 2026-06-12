@@ -98,7 +98,18 @@ export async function uploadToDrive(
     },
   );
   if (!init.ok) {
-    throw new Error(`Drive upload init failed: ${init.status} ${await init.text()}`);
+    const text = await init.text();
+    if (text.includes('SERVICE_DISABLED') || text.includes('accessNotConfigured')) {
+      throw new Error(
+        'The Google Drive API is not enabled for your project yet (or is still propagating — it can take a few minutes). ' +
+          'Enable it in the Google Cloud console under APIs & Services → Library → Google Drive API, wait ~2 minutes, then retry.',
+      );
+    }
+    if (init.status === 401) {
+      cached = null;
+      throw new Error('Google session expired — click → Drive again to re-authorize.');
+    }
+    throw new Error(`Drive upload init failed: ${init.status} ${text}`);
   }
   const sessionUrl = init.headers.get('Location');
   if (!sessionUrl) throw new Error('Drive did not return an upload session URL');
@@ -127,4 +138,36 @@ export async function uploadToDrive(
   });
 
   return { id: fileId, link: `https://drive.google.com/file/d/${fileId}/view` };
+}
+
+// ---- last-export persistence (OPFS) so "→ Drive" survives reloads ----
+
+const EXPORT_FILE = 'last-export.mp4';
+const EXPORT_NAME_KEY = 'dronezoom.lastExportName';
+
+export async function persistExport(blob: Blob, name: string): Promise<void> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const fh = await root.getFileHandle(EXPORT_FILE, { create: true });
+    const w = await fh.createWritable();
+    await w.write(blob);
+    await w.close();
+    localStorage.setItem(EXPORT_NAME_KEY, name);
+  } catch {
+    // OPFS unavailable — Drive upload just requires a fresh export then
+  }
+}
+
+export async function restoreExport(): Promise<{ blob: Blob; name: string } | null> {
+  try {
+    const name = localStorage.getItem(EXPORT_NAME_KEY);
+    if (!name) return null;
+    const root = await navigator.storage.getDirectory();
+    const fh = await root.getFileHandle(EXPORT_FILE);
+    const file = await fh.getFile();
+    if (file.size === 0) return null;
+    return { blob: file, name };
+  } catch {
+    return null;
+  }
 }

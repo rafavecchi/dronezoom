@@ -172,7 +172,7 @@ def track_blobs(clip, A, yolo_samples):
     }
 
 
-def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC):
+def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, widen=None):
     n = len(track["ts"])
     rx = np.empty(n)
     ry = np.empty(n)
@@ -185,7 +185,8 @@ def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC):
     ph = np.interp(ts, track["ts"], gaussian_smooth(track["h"], fps * 0.5))
     sigma = smooth_sec / SAMPLE_DT
     sph = gaussian_smooth(median_filter(ph), sigma * 2)
-    crop_h = np.clip(sph * pad, H / MAX_ZOOM, H)
+    wfac = np.interp(ts, widen[0], widen[1]) if widen is not None else 1.0
+    crop_h = np.clip(sph * pad * wfac, H / MAX_ZOOM, H)
     crop_w = crop_h * (W / H)
     lim_x = crop_w * LEASH_X / 2
     lim_y = crop_h * LEASH_Y / 2
@@ -267,7 +268,19 @@ if __name__ == "__main__":
             errs.append(np.hypot(mx - s["box"]["cx"], my - s["box"]["cy"]))
     print(f"vs confident YOLO ({len(errs)}): median {np.median(errs):.0f}px p90 {np.percentile(errs, 90):.0f}px")
 
-    path = build_path_v4(track, Ds, fps, W, H)
+    # zoom-out-on-pan: widen the crop when the camera moves violently —
+    # the cinematographer's "go wide when the action gets fast"
+    speeds = np.hypot(Ms_src[:, 0, 2], Ms_src[:, 1, 2])
+    # envelope: rolling max keeps whip magnitude, then smooth the shape
+    r = int(fps * 0.3)
+    env = np.array([speeds[max(0, i - r) : i + r + 1].max() for i in range(len(speeds))])
+    sp_s = gaussian_smooth(env, fps * 0.3)
+    x01 = np.clip((sp_s - 40) / (100 - 40), 0, 1)
+    wfac = 1 + 0.8 * (x01 * x01 * (3 - 2 * x01))  # smoothstep
+    widen = (np.arange(len(wfac)) / fps, wfac)
+    print(f"widen factor: median {np.median(wfac):.2f}, p95 {np.percentile(wfac, 95):.2f}, max {wfac.max():.2f}")
+
+    path = build_path_v4(track, Ds, fps, W, H, widen=widen)
     render_v4(clip, "sim-v4.mp4", path, Ds, fps, W, H)
     render_v4(clip, "sim-v4-norot.mp4", path, Ds, fps, W, H, use_rot=False)
     print("rendered sim-v4.mp4 + sim-v4-norot.mp4")

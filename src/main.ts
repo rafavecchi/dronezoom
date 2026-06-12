@@ -1,6 +1,6 @@
 import { runAnalysis, probeFps, type AnalysisResult } from './analyze';
 import { initDetector } from './detect';
-import { getClientId, setClientId, uploadToDrive } from './drive';
+import { getClientId, persistExport, restoreExport, setClientId, uploadToDrive } from './drive';
 import { exportVideo } from './export';
 import { apply, buildResiduals, decompose, IDENTITY, invert, type Affine } from './motion';
 import { buildCropPath, cropAt, gaussianSmooth, type Sample, type CropKey } from './path';
@@ -104,10 +104,30 @@ function rebuildPath() {
     });
   }
 
+  // Zoom-out-on-pan: widen the crop while the camera moves violently —
+  // "go wide when the action gets fast". Envelope (rolling max) keeps
+  // whip magnitude; thresholds scale with resolution (tuned at 1080p).
+  const fps = analysis.fps;
+  const speeds = analysis.incs.map((inc) => Math.hypot(inc.dtx, inc.dty));
+  const r = Math.round(fps * 0.3);
+  const env = speeds.map((_, i) =>
+    Math.max(...speeds.slice(Math.max(0, i - r), Math.min(speeds.length, i + r + 1))),
+  );
+  const spSmooth = gaussianSmooth(env, fps * 0.3);
+  const lo = 0.021 * w;
+  const hi = 0.052 * w;
+  const widenArr = spSmooth.map((s) => {
+    const x01 = clampNum((s - lo) / (hi - lo), 0, 1);
+    return 1 + 0.8 * x01 * x01 * (3 - 2 * x01);
+  });
+  const widen = (t: number) =>
+    widenArr[clampNum(Math.floor(t * fps), 0, widenArr.length - 1)] ?? 1;
+
   const mX = 0.02 * w;
   const mY = 0.025 * h;
   cropPath = buildCropPath(trackSamples, w, h, {
     ...pathOptions(),
+    widen,
     constrain: (_t, cropW, cropH, x, y) => {
       const loX = cropW / 2 + mX;
       const hiX = w - cropW / 2 - mX;
@@ -353,8 +373,7 @@ fileInput.addEventListener('change', () => {
   const file = fileInput.files?.[0];
   if (!file) return;
   clipName = file.name.replace(/\.[^.]+$/, '');
-  lastExport = null;
-  driveBtn.disabled = true;
+  // keep lastExport: → Drive can still upload the previous export
   video.src = URL.createObjectURL(file);
   analysis = null;
   samples = [];
@@ -472,6 +491,7 @@ exportBtn.addEventListener('click', async () => {
     const name = `dronezoom-${clipName}.mp4`;
     lastExport = { blob, name };
     driveBtn.disabled = false;
+    void persistExport(blob, name);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = name;
@@ -493,7 +513,10 @@ exportBtn.addEventListener('click', async () => {
 });
 
 driveBtn.addEventListener('click', async () => {
-  if (!lastExport) return;
+  if (!lastExport) {
+    setStatus('No export yet this session — hit "Export MP4" first, then → Drive uploads it.', true);
+    return;
+  }
   if (!getClientId()) {
     const id = prompt(
       'One-time setup: paste your Google OAuth Client ID.\n\n' +
@@ -535,6 +558,14 @@ driveBtn.addEventListener('click', async () => {
 // stride selector is no longer meaningful (analysis is per-frame now)
 strideSel.disabled = true;
 strideSel.title = 'v2 analyzes every frame';
+
+// restore the last export across reloads so → Drive keeps working
+void restoreExport().then((restored) => {
+  if (restored && !lastExport) {
+    lastExport = restored;
+    driveBtn.disabled = false;
+  }
+});
 
 initDetector()
   .then((ep) => setStatus(`Detector ready (${ep === 'webgpu' ? 'WebGPU 🚀' : 'WASM/CPU — slower'}). Pick a clip.`))

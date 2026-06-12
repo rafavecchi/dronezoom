@@ -36,6 +36,8 @@ export interface PathOptions {
     x: number,
     y: number,
   ) => { x: number; y: number };
+  /** Crop-size multiplier at time t (zoom-out-on-pan), >= 1. */
+  widen?: (t: number) => number;
 }
 
 /**
@@ -67,7 +69,9 @@ export function buildCropPath(
 
   const minCropH = srcH / opts.maxZoom;
   const aspect = srcW / srcH;
-  const cropHs = sPh.map((h) => clamp(h * opts.padFactor, minCropH, srcH));
+  const cropHs = sPh.map((h, i) =>
+    clamp(h * opts.padFactor * (opts.widen?.(samples[i].t) ?? 1), minCropH, srcH),
+  );
 
   // "As smooth as possible, subject to the rider staying inside the leash
   // zone": pure Gaussian smoothing lags behind abrupt drone swings and lets
