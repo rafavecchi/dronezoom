@@ -31,6 +31,8 @@ export interface CameraPath {
   rs: number[];
   /** Fraction of the clip's frames actually measured (1 = no drops). */
   coverage: number;
+  /** Diagnostics: which translation source won per frame, peak stats. */
+  diag: { local: number; full: number; none: number; localPeakMean: number; fullPeakMean: number };
 }
 
 const canvas = document.createElement('canvas');
@@ -122,7 +124,7 @@ function spectrum(gray: Float32Array, w: number, h: number): Spec {
  * its inverse-FFT peak at -d (mod size), so motion = -peak, with
  * parabolic sub-pixel refinement.
  */
-function phaseShift(a: Spec, b: Spec): { dx: number; dy: number } {
+function phaseShift(a: Spec, b: Spec): { dx: number; dy: number; peak: number } {
   const { w, h } = a;
   const n = w * h;
   const re = new Float32Array(n);
@@ -151,7 +153,10 @@ function phaseShift(a: Spec, b: Spec): { dx: number; dy: number } {
   if (dx > w / 2) dx -= w;
   if (dy < -h / 2) dy += h;
   if (dy > h / 2) dy -= h;
-  return { dx, dy };
+  // Peak height of the normalized cross-power surface ≈ correlation
+  // confidence: sharp single peak on textured content, near-noise-floor
+  // on featureless regions (flat dirt, sky).
+  return { dx, dy, peak: re[peak] };
 }
 
 function parabolic(l: number, c: number, r: number): number {
@@ -215,6 +220,11 @@ export async function estimateCameraPath(
   let cy = 0;
   let cr = 0;
   let lastT = 0;
+  let diagLocal = 0;
+  let diagFull = 0;
+  let diagNone = 0;
+  let diagLocalPeak = 0;
+  let diagFullPeak = 0;
 
   await new Promise<void>((resolve) => {
     video.addEventListener('ended', () => resolve(), { once: true });
@@ -241,14 +251,25 @@ export async function estimateCameraPath(
         const shL = phaseShift(prevL, curL);
         const shR = phaseShift(prevR, curR);
 
-        const locOK = Math.abs(dLoc.dx) < LW * 0.3 && Math.abs(dLoc.dy) < LH * 0.3;
-        const fullOK = Math.abs(dFull.dx) < AW * 0.35 && Math.abs(dFull.dy) < AH * 0.35;
-        if (locOK) {
+        // Pick the better-evidenced estimate per frame: the rider-local
+        // window wins only when its correlation peak is decisively sharp
+        // (it can sit on featureless ground); otherwise the full frame.
+        const locOK =
+          Math.abs(dLoc.dx) < LW * 0.3 && Math.abs(dLoc.dy) < LH * 0.3 && dLoc.peak > 0.04;
+        const fullOK =
+          Math.abs(dFull.dx) < AW * 0.35 && Math.abs(dFull.dy) < AH * 0.35 && dFull.peak > 0.01;
+        diagLocalPeak += dLoc.peak;
+        diagFullPeak += dFull.peak;
+        if (locOK && (!fullOK || dLoc.peak > 1.5 * dFull.peak)) {
           cx += dLoc.dx * sxG;
           cy += dLoc.dy * syG;
+          diagLocal++;
         } else if (fullOK) {
           cx += dFull.dx * sxA;
           cy += dFull.dy * syA;
+          diagFull++;
+        } else {
+          diagNone++;
         }
         // Roll: differential vertical motion of the half frames, whose
         // centers sit srcW/2 apart in source pixels.
@@ -282,7 +303,21 @@ export async function estimateCameraPath(
   let minGap = Infinity;
   for (let i = 1; i < ts.length; i++) minGap = Math.min(minGap, ts[i] - ts[i - 1]);
   const expected = Math.max(1, Math.round(video.duration / Math.max(minGap, 1e-3)));
-  return { ts, xs, ys, rs, coverage: Math.min(1, ts.length / expected) };
+  const measured = Math.max(1, ts.length - 1);
+  return {
+    ts,
+    xs,
+    ys,
+    rs,
+    coverage: Math.min(1, ts.length / expected),
+    diag: {
+      local: diagLocal,
+      full: diagFull,
+      none: diagNone,
+      localPeakMean: diagLocalPeak / measured,
+      fullPeakMean: diagFullPeak / measured,
+    },
+  };
 }
 
 /**

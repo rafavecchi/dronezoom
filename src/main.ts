@@ -141,6 +141,17 @@ function rebuildPath() {
   // before hitting the hard frame-boundary clamp.
   const mX = 0.02 * w;
   const mY = 0.025 * h;
+  (window as unknown as Record<string, unknown>).__dz = {
+    samples,
+    camPath,
+    smoothRoll,
+    smoothCamX,
+    smoothCamY,
+    get cropPath() {
+      return cropPath;
+    },
+    opts: pathOptions(),
+  };
   cropPath = buildCropPath(worldSamples, w, h, {
     ...pathOptions(),
     constrain: (t, cropW, cropH, x, y) => {
@@ -338,15 +349,17 @@ async function analyze() {
   let roiHits = 0;
   let processed = 0;
 
-  // Full-frame pass first; if that misses, a zoomed pass around the
-  // predicted position — a rider ~20px tall in downscaled 4K is often
-  // only findable the second way.
+  // Zoomed pass first, always: detection boxes on a rider that is only
+  // 10–40px tall in the downscaled full frame are too noisy to frame
+  // with — the ROI makes the rider 4–8x larger for the detector. Full
+  // frame is the fallback for (re)acquisition.
   const detectAt = async (tracker: Tracker, t: number) => {
     await seekTo(t);
-    let box = tracker.match(video, await detectPersons(video, w, h), t);
-    if (!box) {
-      box = tracker.match(video, await detectPersons(video, w, h, tracker.searchRegion(t)), t);
-      if (box) roiHits++;
+    let box = tracker.match(video, await detectPersons(video, w, h, tracker.searchRegion(t)), t);
+    if (box) {
+      roiHits++;
+    } else {
+      box = tracker.match(video, await detectPersons(video, w, h), t);
     }
     processed++;
     if (box) detected++;
