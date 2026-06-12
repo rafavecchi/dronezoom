@@ -142,8 +142,11 @@ def track_blobs(clip, A, yolo_samples):
                 out_h.append(hh * sy)
             else:
                 miss += 1
-                vx *= 0.9
-                vy *= 0.9
+                # decay own-motion fast on miss: a rider who stopped (e.g.
+                # direction switch) is stationary in world coords, and the
+                # camera-carry already handles apparent motion
+                vx *= 0.75
+                vy *= 0.75
                 px = min(max(px + vx, 0), AW)
                 py = min(max(py + vy, 0), AH)
                 out_h.append(out_h[-1] if out_h else 80.0)

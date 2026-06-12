@@ -219,6 +219,7 @@ export function estimatePair(prev: Spec[], cur: Spec[]): { M: Affine; quality: n
     }
   }
   let M: Affine = IDENTITY;
+  let inliers = 0;
   if (centers.length >= 3) {
     M = fitSimilarity(centers, shifts, weights);
     const kc: Array<[number, number]> = [];
@@ -236,15 +237,19 @@ export function estimatePair(prev: Spec[], cur: Spec[]): { M: Affine; quality: n
         kw.push(weights[i]);
       }
     }
+    inliers = kc.length;
     if (kc.length >= 3 && kc.length < centers.length) M = fitSimilarity(kc, ks, kw);
   }
-  // Sanity: a frame pair can't rotate >2deg or zoom >3% — garbage fits
-  // (whip pans, low texture) would otherwise poison the chain. Fall
-  // back to median translation.
+  // Sanity: garbage fits (whip pans, low texture) would poison the
+  // chain. High-consensus fits (>=4 inlier windows) are trusted to much
+  // larger angles — aggressive drone yaw really does 2-3 deg/frame, and
+  // clamping those frames leaves visible rotational jolts uncorrected.
   const d = decompose(M);
+  const limTheta = inliers >= 4 ? 0.12 : 0.035;
+  const limScale = inliers >= 4 ? 0.08 : 0.03;
   if (
-    Math.abs(d.theta) > 0.035 ||
-    Math.abs(d.scale - 1) > 0.03 ||
+    Math.abs(d.theta) > limTheta ||
+    Math.abs(d.scale - 1) > limScale ||
     Math.hypot(d.tx, d.ty) > 200 ||
     centers.length < 3
   ) {

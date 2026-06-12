@@ -230,8 +230,11 @@ function blobStep(
     state.h = Math.max(3, hh);
   } else {
     state.miss++;
-    state.vx *= 0.9;
-    state.vy *= 0.9;
+    // decay own-motion fast on miss: a rider who stopped (direction
+    // switch) is stationary in world coords, and the camera-carry
+    // already accounts for apparent motion
+    state.vx *= 0.75;
+    state.vy *= 0.75;
     state.x = Math.min(Math.max(state.x + state.vx, 0), BW - 1);
     state.y = Math.min(Math.max(state.y + state.vy, 0), BH - 1);
   }

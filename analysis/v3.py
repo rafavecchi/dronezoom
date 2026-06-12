@@ -81,6 +81,7 @@ def pass_a(clip):
                     centers.append((x0 + WIN / 2, y0 + WIN / 2))
                     shifts.append((dx, dy))
                     weights.append(pk)
+            inliers = 0
             if len(centers) >= 3:
                 M = fit_similarity(centers, shifts, weights)
                 # outlier rejection: drop windows with residual > 3px, refit
@@ -92,17 +93,19 @@ def pass_a(clip):
                         keep_c.append(c)
                         keep_s.append(s)
                         keep_w.append(w)
+                inliers = len(keep_c)
                 if len(keep_c) >= 3 and len(keep_c) < len(centers):
                     M = fit_similarity(keep_c, keep_s, keep_w)
             else:
                 M = np.array([[1.0, 0, 0], [0, 1.0, 0]])
-            # Sanity clamp: a frame pair can't rotate >2deg or zoom >3%.
-            # Garbage fits (whip pans, low texture) otherwise poison the
-            # cumulative chain forever. Fall back to median translation.
+            # Sanity: garbage fits (whip pans, low texture) poison the chain.
+            # High-consensus fits (>=4 inlier windows) are trusted to much
+            # larger angles — aggressive drone yaw really does 2-3 deg/frame.
             a_, b_ = M[0, 0], M[1, 0]
             th_ = np.arctan2(b_, a_)
             sc_ = np.hypot(a_, b_)
-            if abs(th_) > 0.035 or abs(sc_ - 1) > 0.03 or np.hypot(M[0, 2], M[1, 2]) > 200:
+            lim_th, lim_sc = (0.12, 0.08) if inliers >= 4 else (0.035, 0.03)
+            if abs(th_) > lim_th or abs(sc_ - 1) > lim_sc or np.hypot(M[0, 2], M[1, 2]) > 200:
                 if shifts:
                     mdx = float(np.median([s[0] for s in shifts]))
                     mdy = float(np.median([s[1] for s in shifts]))
