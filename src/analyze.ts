@@ -163,11 +163,14 @@ function blobStep(
   const baseRes = sorted[sorted.length >> 1];
   const alignBad = mean > Math.max(2.2 * baseRes, 25);
 
-  // center-surround: compact blobs pop, parallax bands cancel
+  // center-surround: compact blobs pop, parallax bands cancel. The
+  // surround must be wide relative to bush/parallax bands or their
+  // interiors out-score the rider (validated: r=4 tracked the wrong
+  // thing at 734px error, r=10 tracks the rider at 41px).
   const b1a = boxBlur(diff, BW, BH, 1);
   const small = boxBlur(b1a, BW, BH, 1);
-  const b2a = boxBlur(diff, BW, BH, 4);
-  const large = boxBlur(b2a, BW, BH, 4);
+  const b2a = boxBlur(diff, BW, BH, 10);
+  const large = boxBlur(b2a, BW, BH, 10);
 
   const px = Math.min(Math.max(state.x + state.vx, 0), BW - 1);
   const py = Math.min(Math.max(state.y + state.vy, 0), BH - 1);
