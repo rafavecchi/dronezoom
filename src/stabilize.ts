@@ -1,17 +1,27 @@
-// Per-frame global camera-motion estimation via phase correlation on
-// downscaled grayscale frames — the same principle vid.stab uses, running
-// live in the browser. Detection sampling (5–10Hz) can never see 30–60Hz
-// drone shake; this measures it at full frame rate so the renderer can
-// cancel it per frame.
+// Per-frame camera-motion estimation via phase correlation on grayscale
+// frames — the same principle vid.stab uses, running live in the browser.
+// Detection sampling (5–10Hz) can never see 30–60Hz drone shake; this
+// measures it at full frame rate so the renderer can cancel it per frame.
 //
-// Translation: phase correlation of the full downscaled frame.
+// Translation: measured in a window centered on the rider (using the
+// tracked path), at 2x the global analysis resolution. Forward drone
+// flight creates strong vertical parallax — near ground sweeps fast, the
+// horizon barely moves — so a full-frame correlation has no single
+// correct vertical answer and injects noise; the rider-local background
+// is the reference the viewer's eye actually locks onto. The full-frame
+// estimate is kept as a fallback for low-texture windows.
+//
 // Rotation (roll): the frame's left and right halves are correlated
 // separately — roll shows up as opposite vertical motion in the two
 // halves, and the differential gives the angle.
 
-const AW = 512;
+const GW = 1024; // grab resolution
+const GH = 512;
+const AW = 512; // global analysis resolution (grab downsampled 2x)
 const AH = 256;
-const HW = 256; // half width
+const HW = 256; // half width (roll)
+const LW = 256; // rider-local window, in grab pixels
+const LH = 256;
 
 export interface CameraPath {
   ts: number[];
@@ -22,8 +32,8 @@ export interface CameraPath {
 }
 
 const canvas = document.createElement('canvas');
-canvas.width = AW;
-canvas.height = AH;
+canvas.width = GW;
+canvas.height = GH;
 const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
 
 const hannCache = new Map<string, Float32Array>();
@@ -53,22 +63,40 @@ interface Spec {
 }
 
 function grabGray(video: HTMLVideoElement): Float32Array {
-  ctx.drawImage(video, 0, 0, AW, AH);
-  const { data } = ctx.getImageData(0, 0, AW, AH);
-  const g = new Float32Array(AW * AH);
+  ctx.drawImage(video, 0, 0, GW, GH);
+  const { data } = ctx.getImageData(0, 0, GW, GH);
+  const g = new Float32Array(GW * GH);
   for (let i = 0; i < g.length; i++) {
     g[i] = (data[i * 4] * 0.299 + data[i * 4 + 1] * 0.587 + data[i * 4 + 2] * 0.114) / 255;
   }
   return g;
 }
 
-function extractHalf(gray: Float32Array, right: boolean): Float32Array {
-  const out = new Float32Array(HW * AH);
-  const xOff = right ? HW : 0;
+function downsample2x(src: Float32Array): Float32Array {
+  const out = new Float32Array(AW * AH);
   for (let y = 0; y < AH; y++) {
-    for (let x = 0; x < HW; x++) {
-      out[y * HW + x] = gray[y * AW + x + xOff];
+    const r0 = 2 * y * GW;
+    const r1 = r0 + GW;
+    for (let x = 0; x < AW; x++) {
+      const c = 2 * x;
+      out[y * AW + x] = 0.25 * (src[r0 + c] + src[r0 + c + 1] + src[r1 + c] + src[r1 + c + 1]);
     }
+  }
+  return out;
+}
+
+function extractRect(
+  src: Float32Array,
+  stride: number,
+  x0: number,
+  y0: number,
+  w: number,
+  h: number,
+): Float32Array {
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const row = (y0 + y) * stride + x0;
+    for (let x = 0; x < w; x++) out[y * w + x] = src[row + x];
   }
   return out;
 }
@@ -142,13 +170,14 @@ export function estimateShiftGray(
 }
 
 /**
- * Play the clip through once, accumulating per-frame global motion into
- * a camera trajectory (translation in source pixels, roll in radians).
- * Dropped frames are harmless: shifts are measured prev→current
- * regardless of the gap.
+ * Play the clip through once, accumulating per-frame camera motion into
+ * a trajectory (translation in source pixels, roll in radians). Dropped
+ * frames are harmless: shifts are measured prev→current regardless of
+ * the gap.
  */
 export async function estimateCameraPath(
   video: HTMLVideoElement,
+  riderAt: (t: number) => { x: number; y: number },
   onProgress: (t: number) => void,
 ): Promise<CameraPath> {
   const rvfc = (
@@ -160,8 +189,10 @@ export async function estimateCameraPath(
 
   const srcW = video.videoWidth;
   const srcH = video.videoHeight;
-  const sx = srcW / AW;
-  const sy = srcH / AH;
+  const sxG = srcW / GW;
+  const syG = srcH / GH;
+  const sxA = srcW / AW;
+  const syA = srcH / AH;
 
   video.pause();
   await new Promise<void>((resolve) => {
@@ -173,10 +204,11 @@ export async function estimateCameraPath(
   const xs = [0];
   const ys = [0];
   const rs = [0];
-  let gray = grabGray(video);
-  let prev = spectrum(gray, AW, AH);
-  let prevL = spectrum(extractHalf(gray, false), HW, AH);
-  let prevR = spectrum(extractHalf(gray, true), HW, AH);
+  let grayPrev = grabGray(video);
+  let dsPrev = downsample2x(grayPrev);
+  let prevFull = spectrum(dsPrev, AW, AH);
+  let prevL = spectrum(extractRect(dsPrev, AW, 0, 0, HW, AH), HW, AH);
+  let prevR = spectrum(extractRect(dsPrev, AW, HW, 0, HW, AH), HW, AH);
   let cx = 0;
   let cy = 0;
   let cr = 0;
@@ -188,28 +220,45 @@ export async function estimateCameraPath(
       if (video.ended) return;
       const t = meta.mediaTime;
       if (t > lastT + 1e-4) {
-        gray = grabGray(video);
-        const cur = spectrum(gray, AW, AH);
-        const curL = spectrum(extractHalf(gray, false), HW, AH);
-        const curR = spectrum(extractHalf(gray, true), HW, AH);
-        const { dx, dy } = phaseShift(prev, cur);
+        const grayCur = grabGray(video);
+        const dsCur = downsample2x(grayCur);
+        const curFull = spectrum(dsCur, AW, AH);
+        const curL = spectrum(extractRect(dsCur, AW, 0, 0, HW, AH), HW, AH);
+        const curR = spectrum(extractRect(dsCur, AW, HW, 0, HW, AH), HW, AH);
+
+        // Rider-local translation: same source rect from both frames,
+        // centered on the tracked rider position at this time.
+        const r = riderAt(t);
+        const x0 = Math.min(GW - LW, Math.max(0, Math.round((r.x / srcW) * GW - LW / 2)));
+        const y0 = Math.min(GH - LH, Math.max(0, Math.round((r.y / srcH) * GH - LH / 2)));
+        const dLoc = phaseShift(
+          spectrum(extractRect(grayPrev, GW, x0, y0, LW, LH), LW, LH),
+          spectrum(extractRect(grayCur, GW, x0, y0, LW, LH), LW, LH),
+        );
+        const dFull = phaseShift(prevFull, curFull);
         const shL = phaseShift(prevL, curL);
         const shR = phaseShift(prevR, curR);
-        prev = cur;
-        prevL = curL;
-        prevR = curR;
 
-        // A shift this large is a scene cut or estimation failure, not shake.
-        if (Math.abs(dx) < AW * 0.35 && Math.abs(dy) < AH * 0.35) {
-          cx += dx * sx;
-          cy += dy * sy;
+        const locOK = Math.abs(dLoc.dx) < LW * 0.3 && Math.abs(dLoc.dy) < LH * 0.3;
+        const fullOK = Math.abs(dFull.dx) < AW * 0.35 && Math.abs(dFull.dy) < AH * 0.35;
+        if (locOK) {
+          cx += dLoc.dx * sxG;
+          cy += dLoc.dy * syG;
+        } else if (fullOK) {
+          cx += dFull.dx * sxA;
+          cy += dFull.dy * syA;
         }
         // Roll: differential vertical motion of the half frames, whose
         // centers sit srcW/2 apart in source pixels.
-        const dTheta = ((shR.dy - shL.dy) * sy) / (srcW / 2);
+        const dTheta = ((shR.dy - shL.dy) * syA) / (srcW / 2);
         if (Math.abs(dTheta) < 0.05 && Math.abs(shL.dy) < AH * 0.3 && Math.abs(shR.dy) < AH * 0.3) {
           cr += dTheta;
         }
+
+        grayPrev = grayCur;
+        prevFull = curFull;
+        prevL = curL;
+        prevR = curR;
         ts.push(t);
         xs.push(cx);
         ys.push(cy);

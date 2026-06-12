@@ -330,8 +330,25 @@ async function analyze() {
   if (samples.length > 0) {
     setStatus('Measuring per-frame camera shake (plays the clip through once)…');
     progressBar.value = 0;
+    // Rider position over time (frame coords), so the stabilizer can
+    // measure motion in the background around the rider instead of the
+    // parallax-ambiguous full frame.
+    const riderTs: number[] = [];
+    const riderXs: number[] = [];
+    const riderYs: number[] = [];
+    for (const s of samples) {
+      if (s.box) {
+        riderTs.push(s.t);
+        riderXs.push(s.box.cx);
+        riderYs.push(s.box.cy);
+      }
+    }
+    const riderAt = (t: number) =>
+      riderTs.length > 0
+        ? { x: lerpSeries(riderTs, riderXs, t), y: lerpSeries(riderTs, riderYs, t) }
+        : { x: w / 2, y: h / 2 };
     try {
-      camPath = await estimateCameraPath(video, (t) => {
+      camPath = await estimateCameraPath(video, riderAt, (t) => {
         progressBar.value = t / duration;
       });
     } catch (e) {
