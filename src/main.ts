@@ -1,5 +1,5 @@
-import { initDetector, detectPersons, type Detection } from './detect';
-import { buildCropPath, cropAt, pickTarget, type Sample, type CropKey } from './path';
+import { initDetector, detectPersons } from './detect';
+import { buildCropPath, cropAt, Tracker, type Point, type Sample, type CropKey } from './path';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -28,6 +28,7 @@ let samples: Sample[] = [];
 let cropPath: CropKey[] = [];
 let analyzing = false;
 let rafHandle = 0;
+let seedPoint: Point | null = null;
 
 function setStatus(msg: string, isError = false) {
   statusEl.textContent = msg;
@@ -103,6 +104,20 @@ function drawFrame() {
     }
   }
 
+  if (seedPoint && samples.length === 0) {
+    const sx = seedPoint.x * scale;
+    const sy = seedPoint.y * scale;
+    originalCtx.strokeStyle = '#ffd24a';
+    originalCtx.lineWidth = 2;
+    originalCtx.beginPath();
+    originalCtx.arc(sx, sy, 14, 0, Math.PI * 2);
+    originalCtx.moveTo(sx - 20, sy);
+    originalCtx.lineTo(sx + 20, sy);
+    originalCtx.moveTo(sx, sy - 20);
+    originalCtx.lineTo(sx, sy + 20);
+    originalCtx.stroke();
+  }
+
   if (crop) {
     previewCtx.drawImage(
       video,
@@ -133,6 +148,10 @@ function seekTo(t: number): Promise<void> {
 }
 
 async function analyze() {
+  if (!seedPoint) {
+    setStatus('Click on yourself in the left frame first, so I know who to track.', true);
+    return;
+  }
   analyzing = true;
   analyzeBtn.disabled = true;
   playBtn.disabled = true;
@@ -140,6 +159,8 @@ async function analyze() {
   samples = [];
   cropPath = [];
 
+  const { videoWidth: w, videoHeight: h } = video;
+  const tracker = new Tracker(seedPoint, w, h);
   const interval = parseFloat(strideSel.value);
   const duration = video.duration;
   const total = Math.floor(duration / interval) + 1;
@@ -147,22 +168,32 @@ async function analyze() {
   const startedAt = performance.now();
 
   let detected = 0;
+  let roiHits = 0;
   for (let i = 0; i * interval < duration; i++) {
     const t = i * interval;
     await seekTo(t);
-    let dets: Detection[] = [];
+    let box = null;
     try {
-      dets = await detectPersons(video, video.videoWidth, video.videoHeight);
+      // Pass 1: full frame. Pass 2: zoomed window around the predicted
+      // position — a rider that's 20px tall in a downscaled 4K frame is
+      // often only findable this way.
+      box = tracker.match(await detectPersons(video, w, h), t);
+      if (!box) {
+        const roi = tracker.searchRegion(t);
+        box = tracker.match(await detectPersons(video, w, h, roi), t);
+        if (box) roiHits++;
+      }
     } catch (e) {
       setStatus(`Detection failed at ${t.toFixed(1)}s: ${e}`, true);
       break;
     }
-    const box = pickTarget(dets, samples, video.videoWidth, video.videoHeight);
     if (box) detected++;
     samples.push({ t, box });
     progressBar.value = (i + 1) / total;
     if (i % 5 === 0) {
-      setStatus(`Analyzing… ${t.toFixed(1)}s / ${duration.toFixed(1)}s (rider found in ${detected}/${i + 1} frames)`);
+      setStatus(
+        `Analyzing… ${t.toFixed(1)}s / ${duration.toFixed(1)}s — rider in ${detected}/${i + 1} samples (${roiHits} via zoomed re-detect)`,
+      );
       drawFrame();
     }
   }
@@ -188,6 +219,7 @@ fileInput.addEventListener('change', () => {
   video.src = URL.createObjectURL(file);
   samples = [];
   cropPath = [];
+  seedPoint = null;
   video.addEventListener(
     'loadedmetadata',
     () => {
@@ -196,11 +228,25 @@ fileInput.addEventListener('change', () => {
       analyzeBtn.disabled = false;
       playBtn.disabled = false;
       setStatus(
-        `${file.name} — ${video.videoWidth}×${video.videoHeight}, ${video.duration.toFixed(1)}s. Hit Analyze.`,
+        `${file.name} — ${video.videoWidth}×${video.videoHeight}, ${video.duration.toFixed(1)}s. ` +
+          `Click on yourself in the left frame, then Analyze.`,
       );
     },
     { once: true },
   );
+});
+
+originalCanvas.addEventListener('click', (e) => {
+  if (analyzing || !video.videoWidth) return;
+  const rect = originalCanvas.getBoundingClientRect();
+  seedPoint = {
+    x: ((e.clientX - rect.left) / rect.width) * video.videoWidth,
+    y: ((e.clientY - rect.top) / rect.height) * video.videoHeight,
+  };
+  samples = [];
+  cropPath = [];
+  drawFrame();
+  setStatus('Target set. Hit Analyze. (Scrub-free: tracking always starts from the first frame.)');
 });
 
 analyzeBtn.addEventListener('click', () => void analyze());

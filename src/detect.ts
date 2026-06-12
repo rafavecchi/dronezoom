@@ -41,22 +41,40 @@ export async function initDetector(): Promise<string> {
   throw new Error(`Could not initialize ONNX Runtime: ${lastError}`);
 }
 
+export interface Region {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * Detect persons in the frame, or in a sub-region of it. Passing a region
+ * effectively zooms the detector in — essential for riders that are only
+ * a few dozen pixels tall in a full 4K frame downscaled to 640.
+ */
 export async function detectPersons(
   frame: CanvasImageSource,
   srcW: number,
   srcH: number,
+  region?: Region,
 ): Promise<Detection[]> {
   if (!session) throw new Error('Detector not initialized');
 
-  const scale = Math.min(INPUT_SIZE / srcW, INPUT_SIZE / srcH);
-  const drawW = Math.round(srcW * scale);
-  const drawH = Math.round(srcH * scale);
+  const rx = region?.x ?? 0;
+  const ry = region?.y ?? 0;
+  const rw = region?.w ?? srcW;
+  const rh = region?.h ?? srcH;
+
+  const scale = Math.min(INPUT_SIZE / rw, INPUT_SIZE / rh);
+  const drawW = Math.round(rw * scale);
+  const drawH = Math.round(rh * scale);
   const dx = (INPUT_SIZE - drawW) / 2;
   const dy = (INPUT_SIZE - drawH) / 2;
 
   workCtx.fillStyle = '#727272';
   workCtx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
-  workCtx.drawImage(frame, dx, dy, drawW, drawH);
+  workCtx.drawImage(frame, rx, ry, rw, rh, dx, dy, drawW, drawH);
 
   const { data } = workCtx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE);
   const pixels = INPUT_SIZE * INPUT_SIZE;
@@ -82,8 +100,8 @@ export async function detectPersons(
     const score = scores[personOffset + i];
     if (score < SCORE_THRESHOLD) continue;
     candidates.push({
-      cx: (scores[i] - dx) / scale,
-      cy: (scores[anchors + i] - dy) / scale,
+      cx: rx + (scores[i] - dx) / scale,
+      cy: ry + (scores[anchors + i] - dy) / scale,
       w: scores[2 * anchors + i] / scale,
       h: scores[3 * anchors + i] / scale,
       score,

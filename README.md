@@ -5,12 +5,17 @@ Everything runs client-side — no uploads.
 
 ## How it works (milestone 1)
 
-1. Load an MP4 from your DJI Mini 2.
+1. Load an MP4 from your DJI Mini 2 and **click the rider** in the first frame
+   to seed the tracker.
 2. **Analyze** seeks through the clip (default every 0.2s), runs YOLO11n person
-   detection via `onnxruntime-web` (WebGPU, WASM fallback), and tracks the rider
-   across samples.
-3. The raw track is gap-filled and Gaussian-smoothed into a cinematic crop path
-   (heavier smoothing on zoom level to avoid "breathing").
+   detection via `onnxruntime-web` (WebGPU, WASM fallback), and follows the
+   seeded rider with a constant-velocity, distance-gated tracker — a detection
+   outside the gate counts as a miss, never a target switch. When the full
+   frame misses, detection re-runs on a zoomed window around the predicted
+   position (recovers riders only ~20px tall in downscaled 4K).
+3. The raw track is gap-filled, median-filtered (kills single-frame outliers),
+   and Gaussian-smoothed into a cinematic crop path (heavier smoothing on zoom
+   level to avoid "breathing").
 4. Live preview renders the cropped/zoomed view next to the original with
    tracking overlays. Framing tightness and smoothness sliders re-shape the
    path instantly without re-running detection.
