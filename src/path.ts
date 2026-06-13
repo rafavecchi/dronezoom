@@ -57,11 +57,12 @@ export function buildCropPath(
     return [{ t: 0, cx: srcW / 2, cy: srcH / 2, cropW: srcW, cropH: srcH }];
   }
 
-  // Median filter before the Gaussian: a single bad box becomes a spike
-  // the Gaussian would smear into a visible lurch; the median removes it.
-  // (Hampel reference was reverted — part of the smoothness regression.)
-  const cx = medianFilter(fillGaps(samples.map((s) => s.box?.cx ?? null)));
-  const cy = medianFilter(fillGaps(samples.map((s) => s.box?.cy ?? null)));
+  // Radius-1 median for the leash reference: kills single-frame spikes
+  // without lagging a genuine fast move (a heavier median treated a fast
+  // switchback as outliers and clipped it, lagging the crop off the
+  // rider). The blob is size/jump-gated upstream so real spikes are rare.
+  const cx = medianFilter(fillGaps(samples.map((s) => s.box?.cx ?? null)), 1);
+  const cy = medianFilter(fillGaps(samples.map((s) => s.box?.cy ?? null)), 1);
   const ph = medianFilter(fillGaps(samples.map((s) => s.box?.h ?? null)));
 
   const sigma = opts.smoothSigmaSec / opts.sampleInterval;

@@ -280,13 +280,18 @@ def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, w
     sigma = smooth_sec / SAMPLE_DT
     sph = gaussian_smooth(median_filter(ph), sigma * 2)
     wfac = np.interp(ts, widen[0], widen[1]) if widen is not None else 1.0
-    # NOTE: a lost-subject auto zoom-out was tried — it's the right
-    # operator instinct, but on top-down footage YOLO is sparse
-    # EVERYWHERE (the blob tracks fine through it) and during the actual
-    # blackout the blob confidently locks onto grass (high quality), so
-    # there is no reliable online "lost" signal — the trigger fired 82%
-    # of the clip and would zoom-pump the whole video. Reverted. Fixing
-    # the s24-26 blackout needs a learned re-ID tracker (bigger project).
+    # EDGE zoom-out: when the rider reaches the frame boundary the crop
+    # physically cannot center on them (it clamps to the frame), so they
+    # jam into / past the output corner. Widen as the rider nears the
+    # edge so they stay comfortably in a wider frame. Trigger = the
+    # rider's tracked distance to the nearest source-frame edge — a
+    # RELIABLE signal (unlike "am I lost"), firing only when genuinely
+    # cornered (the s24-26 switchback descent).
+    rfx = np.interp(ts, track["ts"], np.asarray(track["x"], float))
+    rfy = np.interp(ts, track["ts"], np.asarray(track["y"], float))
+    edge = np.minimum.reduce([rfx, W - rfx, rfy, H - rfy]) / min(W, H)
+    near = np.clip((0.22 - edge) / 0.22, 0, 1)  # ramps in over the outer 22%
+    wfac = np.maximum(wfac, 1 + 2.0 * gaussian_smooth(near, 4.0))
     crop_h = np.clip(sph * pad * wfac, H / MAX_ZOOM, H)
     crop_w = crop_h * (W / H)
 
@@ -302,16 +307,32 @@ def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, w
     ryi = np.interp(ts, track["ts"], ry)
     cx = median_filter(rxi)
     cy = median_filter(ryi)
-    fx, fy = cx, cy  # (fresh-reference leash tried; reverted, no t25 gain)
+    # Leash reference = lightly-filtered raw rider (radius-1 median kills
+    # single-frame spikes only). A heavier median/hampel treated a fast
+    # switchback as "outliers" and clipped it, lagging the leash.
+    fx = median_filter(rxi, 1)
+    fy = median_filter(ryi, 1)
     lim_x = crop_w * LEASH_X / 2
     lim_y = crop_h * LEASH_Y / 2
     mX, mY = 0.02 * W, 0.025 * H
-    lo_x, hi_x = crop_w / 2 + mX, W - crop_w / 2 - mX
-    lo_y, hi_y = crop_h / 2 + mY, H - crop_h / 2 - mY
+    # Frame-boundary clamp in FRAME coords, not world. The path is in
+    # shake-removed world coords; during a big maneuver the residual D
+    # shifts the rider's world position OUTSIDE [0,W], so a world-space
+    # clamp clipped the path inward and it fell hundreds of px behind the
+    # rider (s24-26). Shift the bounds by the smoothed residual
+    # translation so the clamp means "stay in the visible frame".
+    # heavily smooth the shift so the moving bound itself adds no shake;
+    # the per-frame render clamp still guarantees the hard in-frame limit
+    tx_d, ty_d = Ds[:, 0, 2], Ds[:, 1, 2]
+    fr_ts = np.arange(len(Ds)) / fps
+    txs = np.interp(ts, fr_ts, gaussian_smooth(tx_d, smooth_sec * fps * 2))
+    tys = np.interp(ts, fr_ts, gaussian_smooth(ty_d, smooth_sec * fps * 2))
+    lo_x, hi_x = crop_w / 2 + mX - txs, W - crop_w / 2 - mX - txs
+    lo_y, hi_y = crop_h / 2 + mY - tys, H - crop_h / 2 - mY - tys
 
     def constrain(vx_, vy_):
-        ox = np.where(hi_x < lo_x, W / 2, np.clip(vx_, lo_x, hi_x))
-        oy = np.where(hi_y < lo_y, H / 2, np.clip(vy_, lo_y, hi_y))
+        ox = np.where(hi_x < lo_x, (lo_x + hi_x) / 2, np.clip(vx_, lo_x, hi_x))
+        oy = np.where(hi_y < lo_y, (lo_y + hi_y) / 2, np.clip(vy_, lo_y, hi_y))
         return ox, oy
 
     sx_ = gaussian_smooth(cx, sigma)

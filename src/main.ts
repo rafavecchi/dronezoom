@@ -103,10 +103,32 @@ function rebuildPath() {
   const widen = (t: number) =>
     widenArr[clampNum(Math.floor(t * fps), 0, widenArr.length - 1)] ?? 1;
 
-  // Shake residuals, capped to what the crop's leash can absorb: full
   // NOTE: the correction-cap (attenuateResiduals) was a smoothness
   // regression (user-confirmed) — reverted to full shake cancellation.
   Ds = buildResiduals(analysis.incs, fps, smoothSec);
+
+  // Heavily-smoothed residual translation per frame — used to express the
+  // frame-boundary clamp in FRAME coords (see constrain below).
+  const txSmooth = gaussianSmooth(Ds.map((D) => D[2]), smoothSec * fps * 2);
+  const tySmooth = gaussianSmooth(Ds.map((D) => D[5]), smoothSec * fps * 2);
+
+  // EDGE zoom-out: when the rider nears the source-frame boundary the
+  // crop can't center on them, so widen to keep them framed. Trigger =
+  // tracked distance to the nearest edge (reliable), firing only when
+  // genuinely cornered. Combine with the pan-widen (take the max).
+  const edgeWiden = new Float64Array(analysis.frames);
+  for (let k = 0; k < analysis.frames; k++) {
+    const e =
+      Math.min(analysis.blobX[k], w - analysis.blobX[k], analysis.blobY[k], h - analysis.blobY[k]) /
+      Math.min(w, h);
+    const near = clampNum((0.22 - e) / 0.22, 0, 1);
+    edgeWiden[k] = near * near * (3 - 2 * near);
+  }
+  const edgeWidenS = gaussianSmooth(Array.from(edgeWiden), fps * 0.3);
+  const widenCombined = (t: number) => {
+    const k = clampNum(Math.floor(t * fps), 0, edgeWidenS.length - 1);
+    return Math.max(widen(t), 1 + 2.0 * edgeWidenS[k]);
+  };
 
   // Rider track -> "intended camera" coordinates (shake removed), then
   // downsample to the path grid.
@@ -131,15 +153,23 @@ function rebuildPath() {
   const mY = 0.025 * h;
   cropPath = buildCropPath(trackSamples, w, h, {
     ...pathOptions(),
-    widen,
-    constrain: (_t, cropW, cropH, x, y) => {
-      const loX = cropW / 2 + mX;
-      const hiX = w - cropW / 2 - mX;
-      const loY = cropH / 2 + mY;
-      const hiY = h - cropH / 2 - mY;
+    widen: widenCombined,
+    // Frame-boundary clamp in FRAME coords, not world: the path is in
+    // shake-removed world coords; during a big maneuver the residual D
+    // shifts the rider's world position outside [0,w], so a world-space
+    // clamp clipped the path inward and it fell hundreds of px behind the
+    // rider near edges. Shift bounds by the smoothed residual translation.
+    constrain: (t, cropW, cropH, x, y) => {
+      const k = clampNum(Math.floor(t * fps), 0, txSmooth.length - 1);
+      const tx = txSmooth[k];
+      const ty = tySmooth[k];
+      const loX = cropW / 2 + mX - tx;
+      const hiX = w - cropW / 2 - mX - tx;
+      const loY = cropH / 2 + mY - ty;
+      const hiY = h - cropH / 2 - mY - ty;
       return {
-        x: hiX < loX ? w / 2 : clampNum(x, loX, hiX),
-        y: hiY < loY ? h / 2 : clampNum(y, loY, hiY),
+        x: hiX < loX ? (loX + hiX) / 2 : clampNum(x, loX, hiX),
+        y: hiY < loY ? (loY + hiY) / 2 : clampNum(y, loY, hiY),
       };
     },
   });
