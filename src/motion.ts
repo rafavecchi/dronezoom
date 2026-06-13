@@ -295,6 +295,25 @@ export function buildResiduals(
   return out;
 }
 
+/**
+ * Cap the applied shake-correction translation per frame. During
+ * violent maneuvers the residual reaches hundreds of px: full
+ * correction keeps the WORLD stable but swings the rider (whom the
+ * drone chases) outside any leash. caps = 80% of the tighter leash
+ * slack for that frame's crop; above it the camera rides along.
+ */
+export function attenuateResiduals(Ds: Affine[], caps: number[], fps: number): Affine[] {
+  const f = Ds.map((D, i) => {
+    const mag = Math.hypot(D[2], D[5]);
+    const cap = caps[Math.min(i, caps.length - 1)] ?? Infinity;
+    return Math.min(1, cap / Math.max(mag, 1e-6));
+  });
+  const fs = gaussianSmoothArr(f, fps * 0.15);
+  return Ds.map(
+    (D, i) => [D[0], D[1], D[2] * fs[i], D[3], D[4], D[5] * fs[i]] as Affine,
+  );
+}
+
 function gaussianSmoothArr(values: number[], sigma: number): number[] {
   if (sigma <= 0) return values.slice();
   const radius = Math.max(1, Math.ceil(sigma * 3));

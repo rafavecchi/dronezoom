@@ -2,7 +2,15 @@ import { runAnalysis, probeFps, type AnalysisResult } from './analyze';
 import { initDetector } from './detect';
 import { getClientId, persistExport, restoreExport, setClientId, uploadToDrive } from './drive';
 import { exportVideo } from './export';
-import { apply, buildResiduals, decompose, IDENTITY, invert, type Affine } from './motion';
+import {
+  apply,
+  attenuateResiduals,
+  buildResiduals,
+  decompose,
+  IDENTITY,
+  invert,
+  type Affine,
+} from './motion';
 import { buildCropPath, cropAt, gaussianSmooth, type Sample, type CropKey } from './path';
 import type { Point } from './tracker';
 
@@ -82,32 +90,12 @@ function rebuildPath() {
   if (!analysis) return;
   const { videoWidth: w, videoHeight: h } = video;
   const smoothSec = parseFloat(smoothSlider.value);
-  Ds = buildResiduals(analysis.incs, analysis.fps, smoothSec);
-
-  // Rider track -> "intended camera" coordinates (shake removed), then
-  // downsample to the path grid.
-  const hSmooth = gaussianSmooth(Array.from(analysis.blobH), analysis.fps * 0.5);
-  const trackSamples: Sample[] = [];
-  for (let t = 0; t < analysis.frames / analysis.fps; t += SAMPLE_DT) {
-    const k = frameIndexAt(t);
-    const Di = invert(Ds[clampNum(k, 0, Ds.length - 1)]);
-    const p = apply(Di, analysis.blobX[k], analysis.blobY[k]);
-    trackSamples.push({
-      t,
-      box: {
-        cx: p.x,
-        cy: p.y,
-        w: hSmooth[k] * 0.8,
-        h: clampNum(hSmooth[k] * 1.6, 0.04 * h, 0.3 * h),
-        score: 1,
-      },
-    });
-  }
+  const fps = analysis.fps;
+  const hSmooth = gaussianSmooth(Array.from(analysis.blobH), fps * 0.5);
 
   // Zoom-out-on-pan: widen the crop while the camera moves violently —
   // "go wide when the action gets fast". Envelope (rolling max) keeps
   // whip magnitude; thresholds scale with resolution (tuned at 1080p).
-  const fps = analysis.fps;
   const speeds = analysis.incs.map((inc) => Math.hypot(inc.dtx, inc.dty));
   const r = Math.round(fps * 0.3);
   const env = speeds.map((_, i) =>
@@ -122,6 +110,39 @@ function rebuildPath() {
   });
   const widen = (t: number) =>
     widenArr[clampNum(Math.floor(t * fps), 0, widenArr.length - 1)] ?? 1;
+
+  // Shake residuals, capped to what the crop's leash can absorb: full
+  // correction during violent maneuvers swings the rider (whom the
+  // drone chases) out of any leash — above the cap, ride along instead.
+  const pad = parseFloat(padSlider.value);
+  const raw = buildResiduals(analysis.incs, fps, smoothSec);
+  const caps = raw.map((_, i) => {
+    const k = clampNum(i, 0, hSmooth.length - 1);
+    const hBox = clampNum(hSmooth[k] * 1.6, 0.04 * h, 0.3 * h);
+    const cropH = clampNum(hBox * pad * (widenArr[k] ?? 1), h / MAX_ZOOM, h);
+    // leash fractions mirror path.ts (0.45 horizontal, 0.35 vertical)
+    return (0.8 * Math.min(0.45 * cropH * (w / h), 0.35 * cropH)) / 2;
+  });
+  Ds = attenuateResiduals(raw, caps, fps);
+
+  // Rider track -> "intended camera" coordinates (shake removed), then
+  // downsample to the path grid.
+  const trackSamples: Sample[] = [];
+  for (let t = 0; t < analysis.frames / fps; t += SAMPLE_DT) {
+    const k = frameIndexAt(t);
+    const Di = invert(Ds[clampNum(k, 0, Ds.length - 1)]);
+    const p = apply(Di, analysis.blobX[k], analysis.blobY[k]);
+    trackSamples.push({
+      t,
+      box: {
+        cx: p.x,
+        cy: p.y,
+        w: hSmooth[k] * 0.8,
+        h: clampNum(hSmooth[k] * 1.6, 0.04 * h, 0.3 * h),
+        score: 1,
+      },
+    });
+  }
 
   const mX = 0.02 * w;
   const mY = 0.025 * h;

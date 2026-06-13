@@ -33,6 +33,10 @@ for lo in range(0, int(dur), 5):
             mx = np.interp(s["t"], ts, track["x"])
             my = np.interp(s["t"], ts, track["y"])
             errs.append(np.hypot(mx - s["box"]["cx"], my - s["box"]["cy"]))
-    e = f"err med {np.median(errs):4.0f}px ({len(errs)})" if errs else "no conf YOLO"
+    e = (
+        f"err med {np.median(errs):4.0f} p90 {np.percentile(errs, 90):4.0f}px ({len(errs)})"
+        if errs
+        else "no conf YOLO"
+    )
     ym = (yts >= lo) & (yts < lo + 5)
     print(f"  t={lo:2d}-{lo + 5:2d}s: blob {found:3.0f}%  {e}  yolo-best {yscore[ym].max():.2f}")

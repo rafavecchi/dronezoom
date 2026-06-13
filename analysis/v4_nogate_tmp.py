@@ -53,39 +53,6 @@ def residuals_incremental(Ms_src, fps, smooth_sec=SMOOTH_SEC, leak=0.005):
     return np.array(out)
 
 
-def hampel(v, radius=3, k=3.0, floor=40.0):
-    """Outlier rejection that preserves dynamics: replace a sample with
-    the local median ONLY if it deviates by > max(k*MAD, floor px). A
-    plain median filter lags genuine fast turns by hundreds of px, which
-    made the leash hold the path to a stale reference."""
-    out = v.copy()
-    n = len(v)
-    for i in range(n):
-        win = v[max(0, i - radius) : i + radius + 1]
-        med = np.median(win)
-        mad = np.median(np.abs(win - med)) * 1.4826
-        if abs(v[i] - med) > max(k * mad, floor):
-            out[i] = med
-    return out
-
-
-def attenuate_residuals(Ds, cap_series, fps):
-    """Cap the applied shake-correction translation per frame. During
-    violent maneuvers |D.t| reaches 300-700px: full correction keeps the
-    WORLD stable but swings the rider (whom the drone chases) out of any
-    leash. The cap = 80% of the tighter leash slack for that frame's
-    crop, so the leash can always hold; above it the camera rides along
-    with the drone instead of fighting it."""
-    th, sc, tx, ty = decompose(Ds)
-    mag = np.hypot(tx, ty)
-    f = np.minimum(1.0, cap_series / np.maximum(mag, 1e-6))
-    f = gaussian_smooth(f, fps * 0.15)
-    out = Ds.copy()
-    out[:, 0, 2] = tx * f
-    out[:, 1, 2] = ty * f
-    return out
-
-
 def to_source_Ms(Ms, W, H):
     sx, sy = W / AW, H / AH
     S = np.array([[sx, 0, 0], [0, sy, 0]])
@@ -156,11 +123,12 @@ def track_blobs(clip, A, yolo_samples):
             k = int(np.argmax(score))
             bx, by = k % AW, k // AW
             quality = float(resp[by, bx])
-            # NOTE: a hard "physics gate" on candidate jumps was tried and
-            # reverted twice — it blocks whip-pan re-acquisition (clip 2:
-            # found 99->84%, p90 84->700px). Steal repair happens at the
-            # path level instead (outlier rejection in build_path_v4).
-            found = quality > 4.0 and not align_bad
+            # physics gate: a rider can't teleport — a candidate far from
+            # the velocity-predicted position is a distractor (grass,
+            # parallax). Relaxes with the miss streak so true losses
+            # re-acquire.
+            jump = np.hypot(bx - cx_pred, by - cy_pred)
+            found = quality > 4.0 and not align_bad and jump <= 1e9
             if found:
                 # refine: centroid of strong response near peak
                 r = 12
@@ -223,28 +191,20 @@ def track_blobs(clip, A, yolo_samples):
 
 def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, widen=None):
     n = len(track["ts"])
+    rx = np.empty(n)
+    ry = np.empty(n)
+    for j in range(n):
+        Di = invert(Ds[min(j + 1, len(Ds) - 1)])
+        rx[j], ry[j] = apply_a(Di, track["x"][j], track["y"][j])
     ts = np.arange(0, track["ts"][-1], SAMPLE_DT)
-    # crop size first (independent of Ds), so the correction cap can be
-    # derived from the leash slack of the actual crop
+    cx = median_filter(np.interp(ts, track["ts"], rx))
+    cy = median_filter(np.interp(ts, track["ts"], ry))
     ph = np.interp(ts, track["ts"], gaussian_smooth(track["h"], fps * 0.5))
     sigma = smooth_sec / SAMPLE_DT
     sph = gaussian_smooth(median_filter(ph), sigma * 2)
     wfac = np.interp(ts, widen[0], widen[1]) if widen is not None else 1.0
     crop_h = np.clip(sph * pad * wfac, H / MAX_ZOOM, H)
     crop_w = crop_h * (W / H)
-
-    frame_ts = np.arange(len(Ds)) / fps
-    crop_h_f = np.interp(frame_ts, ts, crop_h)
-    cap = 0.8 * np.minimum(LEASH_X * crop_h_f * (W / H), LEASH_Y * crop_h_f) / 2
-    Ds = attenuate_residuals(Ds, cap, fps)
-
-    rx = np.empty(n)
-    ry = np.empty(n)
-    for j in range(n):
-        Di = invert(Ds[min(j + 1, len(Ds) - 1)])
-        rx[j], ry[j] = apply_a(Di, track["x"][j], track["y"][j])
-    cx = hampel(np.interp(ts, track["ts"], rx))
-    cy = hampel(np.interp(ts, track["ts"], ry))
     lim_x = crop_w * LEASH_X / 2
     lim_y = crop_h * LEASH_Y / 2
     mX, mY = 0.02 * W, 0.025 * H
@@ -268,8 +228,7 @@ def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, w
     sx_ = np.clip(sx_, cx - lim_x, cx + lim_x)
     sy_ = np.clip(sy_, cy - lim_y, cy + lim_y)
     sx_, sy_ = constrain(sx_, sy_)
-    # the attenuated Ds must also be what the renderer applies
-    return {"ts": ts, "cx": sx_, "cy": sy_, "cropW": crop_w, "cropH": crop_h}, Ds
+    return {"ts": ts, "cx": sx_, "cy": sy_, "cropW": crop_w, "cropH": crop_h}
 
 
 def render_v4(clip, out_path, path, Ds, fps, W, H, use_rot=True):
@@ -338,7 +297,7 @@ if __name__ == "__main__":
     widen = (np.arange(len(wfac)) / fps, wfac)
     print(f"widen factor: median {np.median(wfac):.2f}, p95 {np.percentile(wfac, 95):.2f}, max {wfac.max():.2f}")
 
-    path, Ds = build_path_v4(track, Ds, fps, W, H, widen=widen)
+    path = build_path_v4(track, Ds, fps, W, H, widen=widen)
     render_v4(clip, "sim-v4.mp4", path, Ds, fps, W, H)
     render_v4(clip, "sim-v4-norot.mp4", path, Ds, fps, W, H, use_rot=False)
     print("rendered sim-v4.mp4 + sim-v4-norot.mp4")

@@ -57,11 +57,12 @@ export function buildCropPath(
     return [{ t: 0, cx: srcW / 2, cy: srcH / 2, cropW: srcW, cropH: srcH }];
   }
 
-  // Median filter before the Gaussian: a single bad box (shadow, bush)
-  // becomes a spike the Gaussian would smear into a visible camera lurch;
-  // the median removes it outright.
-  const cx = medianFilter(fillGaps(samples.map((s) => s.box?.cx ?? null)));
-  const cy = medianFilter(fillGaps(samples.map((s) => s.box?.cy ?? null)));
+  // Hampel filter: replaces only statistical outliers (steal spikes)
+  // and passes genuine fast turns through — a plain median filter lags
+  // real direction changes by hundreds of px, making the leash hold the
+  // path to a stale reference.
+  const cx = hampel(fillGaps(samples.map((s) => s.box?.cx ?? null)));
+  const cy = hampel(fillGaps(samples.map((s) => s.box?.cy ?? null)));
   const ph = medianFilter(fillGaps(samples.map((s) => s.box?.h ?? null)));
 
   const sigma = opts.smoothSigmaSec / opts.sampleInterval;
@@ -178,6 +179,20 @@ function fillGaps(values: (number | null)[]): number[] {
   for (let i = 0; i < firstKnown; i++) out[i] = out[firstKnown];
   for (let i = prevKnown + 1; i < n; i++) out[i] = out[prevKnown];
   return out as number[];
+}
+
+function hampel(values: number[], radius = 3, k = 3, floorPx = 40): number[] {
+  const n = values.length;
+  const out = values.slice();
+  for (let i = 0; i < n; i++) {
+    const win = values.slice(Math.max(0, i - radius), Math.min(n, i + radius + 1));
+    const sorted = [...win].sort((a, b) => a - b);
+    const med = sorted[sorted.length >> 1];
+    const devs = win.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+    const mad = devs[devs.length >> 1] * 1.4826;
+    if (Math.abs(values[i] - med) > Math.max(k * mad, floorPx)) out[i] = med;
+  }
+  return out;
 }
 
 function medianFilter(values: number[], radius = 2): number[] {
