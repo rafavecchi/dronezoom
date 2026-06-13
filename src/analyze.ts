@@ -195,7 +195,11 @@ function blobStep(
     }
   }
   const quality = small[by * BW + bx] - 0.8 * large[by * BW + bx];
-  const found = quality > 4 && !alignBad;
+  // Generous jump gate: reject noise-grabs far from the velocity
+  // prediction (another rider's motion) while allowing fast riding.
+  // ~56 BW-px == the worker's 120 analysis-px, scaled by the miss streak.
+  const jump = Math.hypot(bx - px, by - py);
+  const found = quality > 4 && !alignBad && jump < 56 * (1 + state.miss / 6);
   if (found) {
     // centroid refine
     const r = 6;
@@ -401,16 +405,20 @@ export async function runAnalysis(
           // snapping injects detection-box noise as vertical rocking.
           const bx = box.cx / toSrc / DS;
           const by = box.cy / toSrc / DS;
+          const boxH = box.h / toSrc / DS;
           const d = Math.hypot(bx - blob.x, by - blob.y);
-          if (d > 30) {
+          // Size sanity: a far snap to a detection a third/triple the
+          // rider's size is a distant group / spurious box, not the rider.
+          const sizeOk = boxH > blob.h * 0.45 && boxH < blob.h * 2.2;
+          if (d > 30 && sizeOk) {
             blob.x = bx;
             blob.y = by;
             blob.miss = 0;
-          } else {
+          } else if (d <= 30) {
             blob.x = 0.9 * blob.x + 0.1 * bx;
             blob.y = 0.9 * blob.y + 0.1 * by;
           }
-          blob.h = Math.max(blob.h, box.h / toSrc / DS);
+          blob.h = Math.max(blob.h, boxH);
         }
         samples.push({ t, box });
       }

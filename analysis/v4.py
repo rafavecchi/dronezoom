@@ -186,11 +186,13 @@ def track_blobs(clip, A, yolo_samples):
             k = int(np.argmax(score))
             bx, by = k % AW, k // AW
             quality = float(resp[by, bx])
-            # NOTE: a hard "physics gate" on candidate jumps was tried and
-            # reverted twice — it blocks whip-pan re-acquisition (clip 2:
-            # found 99->84%, p90 84->700px). Steal repair happens at the
-            # path level instead (outlier rejection in build_path_v4).
-            found = quality > 4.0 and not align_bad
+            # GENEROUS jump gate: reject only noise-grabs far from the
+            # velocity prediction (e.g. another rider's motion 280px
+            # away), while allowing genuinely fast riding (~50px/frame).
+            # Earlier gates at 40px were too tight (broke whip recovery);
+            # 120px scaled by the miss streak keeps re-acquisition.
+            jump = np.hypot(bx - cx_pred, by - cy_pred)
+            found = quality > 4.0 and not align_bad and jump < 120 * (1 + miss / 6)
             if found:
                 # refine: centroid of strong response near peak
                 r = 12

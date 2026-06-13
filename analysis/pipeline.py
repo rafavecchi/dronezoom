@@ -102,7 +102,22 @@ def detect_pass(path, roi_first=True):
     dur = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
     samples = []
     prev = None
+    recent_h = []  # running rider heights, for the size-consistency gate
+    miss = 0
     t = 0.0
+
+    def acceptable(d):
+        # SIZE gate: the rider cannot change apparent size by >2x between
+        # samples — this is what stops the lock jumping from the near
+        # rider (h~98) to a distant group of people (h~30). Loosens with
+        # the miss streak so a genuine loss can still re-acquire.
+        if not recent_h:
+            return True
+        med = float(np.median(recent_h[-12:]))
+        lo, hi = 0.5, 2.0
+        slack = 1 + miss * 0.2
+        return med / (hi * slack) <= d["h"] <= med * (hi * slack)
+
     while t < dur:
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         ok, frame = cap.read()
@@ -110,14 +125,14 @@ def detect_pass(path, roi_first=True):
             break
         box = None
         if roi_first:
-            # search region: clamp(8*prev_h, 480, H) centered on prediction
             if prev is not None:
                 size = min(max(prev["h"] * 8, 480), H)
                 cxp, cyp = prev["cx"], prev["cy"]
             else:
-                # seed: full-frame best person (single-rider clip)
                 full = detect_persons(frame)
                 prev = full[0] if full else None
+                if prev:
+                    recent_h.append(prev["h"])
                 samples.append({"t": t, "box": prev})
                 t += SAMPLE_INTERVAL
                 continue
@@ -126,22 +141,25 @@ def detect_pass(path, roi_first=True):
             dets = detect_persons(frame, (x0, y0, min(size, W), min(size, H)))
         else:
             dets = detect_persons(frame)
-        # nearest-to-prediction gate (simplified tracker: single rider)
-        if dets and prev is not None:
-            gate = 0.3 * np.hypot(W, H)
-            best = min(dets, key=lambda d: np.hypot(d["cx"] - prev["cx"], d["cy"] - prev["cy"]))
+        gate = 0.3 * np.hypot(W, H) * (1 + miss * 0.15)
+        # nearest acceptable (size-consistent) detection to the prediction
+        cands = [d for d in dets if acceptable(d)] if prev is not None else dets
+        if cands and prev is not None:
+            best = min(cands, key=lambda d: np.hypot(d["cx"] - prev["cx"], d["cy"] - prev["cy"]))
             if np.hypot(best["cx"] - prev["cx"], best["cy"] - prev["cy"]) < gate:
                 box = best
-        if box is None and not roi_first:
-            pass
         if box is None:
-            full = detect_persons(frame)
+            full = [d for d in detect_persons(frame) if acceptable(d)]
             if full and prev is not None:
                 best = min(full, key=lambda d: np.hypot(d["cx"] - prev["cx"], d["cy"] - prev["cy"]))
-                if np.hypot(best["cx"] - prev["cx"], best["cy"] - prev["cy"]) < 0.3 * np.hypot(W, H):
+                if np.hypot(best["cx"] - prev["cx"], best["cy"] - prev["cy"]) < gate:
                     box = best
         if box is not None:
             prev = box
+            recent_h.append(box["h"])
+            miss = 0
+        else:
+            miss += 1
         samples.append({"t": t, "box": box})
         t += SAMPLE_INTERVAL
     cap.release()
