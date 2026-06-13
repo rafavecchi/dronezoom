@@ -5,6 +5,8 @@ dist/
 *.MP4
 analysis/*.jpg
 analysis/cache/
+analysis/__pycache__/
+**/__pycache__/
 worker/client_secret.json
 worker/token.json
 worker/*.log

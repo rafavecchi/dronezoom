@@ -141,6 +141,7 @@ def track_blobs(clip, A, yolo_samples):
     SEARCH = 80
     res_hist = []
     miss = 0
+    since_yolo = 0  # frames since a confident detection confirmed the lock
     out_t, out_x, out_y, out_h, out_q = [], [], [], [], []
     i = 0
     while True:
@@ -186,11 +187,13 @@ def track_blobs(clip, A, yolo_samples):
             k = int(np.argmax(score))
             bx, by = k % AW, k // AW
             quality = float(resp[by, bx])
-            # GENEROUS jump gate: reject only noise-grabs far from the
-            # velocity prediction (e.g. another rider's motion 280px
-            # away), while allowing genuinely fast riding (~50px/frame).
-            # Earlier gates at 40px were too tight (broke whip recovery);
-            # 120px scaled by the miss streak keeps re-acquisition.
+            # Jump gate vs the velocity prediction. With recent YOLO
+            # support, stay GENEROUS (120px) so fast riding / re-acquire
+            # works and YOLO corrects errors. During a detection GAP
+            # (rider invisible, e.g. deep-shadow switchback), tighten to
+            # ~55px so the blob COASTS along its established velocity
+            # instead of drifting onto perpendicular grass texture — that
+            # drift was carrying the crop off the rider (s24-27).
             jump = np.hypot(bx - cx_pred, by - cy_pred)
             found = quality > 4.0 and not align_bad and jump < 120 * (1 + miss / 6)
             if found:
@@ -247,6 +250,11 @@ def track_blobs(clip, A, yolo_samples):
                         miss = 0
                     else:
                         px, py = 0.9 * px + 0.1 * yx, 0.9 * py + 0.1 * yyc
+                    since_yolo = 0
+                else:
+                    since_yolo += 1
+            else:
+                since_yolo += 1
             out_t.append(t)
             out_x.append(px * sx)
             out_y.append(py * sy)
@@ -272,6 +280,13 @@ def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, w
     sigma = smooth_sec / SAMPLE_DT
     sph = gaussian_smooth(median_filter(ph), sigma * 2)
     wfac = np.interp(ts, widen[0], widen[1]) if widen is not None else 1.0
+    # NOTE: a lost-subject auto zoom-out was tried — it's the right
+    # operator instinct, but on top-down footage YOLO is sparse
+    # EVERYWHERE (the blob tracks fine through it) and during the actual
+    # blackout the blob confidently locks onto grass (high quality), so
+    # there is no reliable online "lost" signal — the trigger fired 82%
+    # of the clip and would zoom-pump the whole video. Reverted. Fixing
+    # the s24-26 blackout needs a learned re-ID tracker (bigger project).
     crop_h = np.clip(sph * pad * wfac, H / MAX_ZOOM, H)
     crop_w = crop_h * (W / H)
 
@@ -283,8 +298,11 @@ def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, w
     for j in range(n):
         Di = invert(Ds[min(j + 1, len(Ds) - 1)])
         rx[j], ry[j] = apply_a(Di, track["x"][j], track["y"][j])
-    cx = median_filter(np.interp(ts, track["ts"], rx))
-    cy = median_filter(np.interp(ts, track["ts"], ry))
+    rxi = np.interp(ts, track["ts"], rx)
+    ryi = np.interp(ts, track["ts"], ry)
+    cx = median_filter(rxi)
+    cy = median_filter(ryi)
+    fx, fy = cx, cy  # (fresh-reference leash tried; reverted, no t25 gain)
     lim_x = crop_w * LEASH_X / 2
     lim_y = crop_h * LEASH_Y / 2
     mX, mY = 0.02 * W, 0.025 * H
@@ -300,13 +318,13 @@ def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, w
     sy_ = gaussian_smooth(cy, sigma)
     for it in range(6):
         s = sigma * 0.55 ** (it + 1)
-        sx_ = np.clip(sx_, cx - lim_x, cx + lim_x)
-        sy_ = np.clip(sy_, cy - lim_y, cy + lim_y)
+        sx_ = np.clip(sx_, fx - lim_x, fx + lim_x)
+        sy_ = np.clip(sy_, fy - lim_y, fy + lim_y)
         sx_, sy_ = constrain(sx_, sy_)
         sx_ = gaussian_smooth(sx_, s)
         sy_ = gaussian_smooth(sy_, s)
-    sx_ = np.clip(sx_, cx - lim_x, cx + lim_x)
-    sy_ = np.clip(sy_, cy - lim_y, cy + lim_y)
+    sx_ = np.clip(sx_, fx - lim_x, fx + lim_x)
+    sy_ = np.clip(sy_, fy - lim_y, fy + lim_y)
     sx_, sy_ = constrain(sx_, sy_)
     # the attenuated Ds must also be what the renderer applies
     return {"ts": ts, "cx": sx_, "cy": sy_, "cropW": crop_w, "cropH": crop_h}, Ds
