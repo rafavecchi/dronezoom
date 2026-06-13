@@ -57,12 +57,12 @@ export function buildCropPath(
     return [{ t: 0, cx: srcW / 2, cy: srcH / 2, cropW: srcW, cropH: srcH }];
   }
 
-  // Hampel filter: replaces only statistical outliers (steal spikes)
-  // and passes genuine fast turns through — a plain median filter lags
-  // real direction changes by hundreds of px, making the leash hold the
-  // path to a stale reference.
-  const cx = hampel(fillGaps(samples.map((s) => s.box?.cx ?? null)));
-  const cy = hampel(fillGaps(samples.map((s) => s.box?.cy ?? null)));
+  // Hampel kills steal spikes without cutting turn apexes (a median
+  // filter lagged real turns by hundreds of px); the light gaussian
+  // keeps the leash reference from transmitting per-sample track noise
+  // into the path (the leash hard-clamps to this reference).
+  const cx = gaussianSmooth(hampel(fillGaps(samples.map((s) => s.box?.cx ?? null))), 1.2);
+  const cy = gaussianSmooth(hampel(fillGaps(samples.map((s) => s.box?.cy ?? null))), 1.2);
   const ph = medianFilter(fillGaps(samples.map((s) => s.box?.h ?? null)));
 
   const sigma = opts.smoothSigmaSec / opts.sampleInterval;

@@ -70,19 +70,33 @@ def hampel(v, radius=3, k=3.0, floor=40.0):
 
 
 def attenuate_residuals(Ds, cap_series, fps):
-    """Cap the applied shake-correction translation per frame. During
-    violent maneuvers |D.t| reaches 300-700px: full correction keeps the
-    WORLD stable but swings the rider (whom the drone chases) out of any
-    leash. The cap = 80% of the tighter leash slack for that frame's
-    crop, so the leash can always hold; above it the camera rides along
-    with the drone instead of fighting it."""
+    """Cap only the LOW-frequency part of the correction translation.
+
+    D.t = slow divergence (actual vs intended camera during maneuvers,
+    can reach 700px — following it fully swings the rider out of any
+    leash) + fast shake (tens of px — must ALWAYS be fully canceled).
+    Capping the total threw away shake cancellation exactly during the
+    violent stretches (measured 6x jitter regression); capping the LF
+    band keeps the rider leashable AND the output shake-free."""
     th, sc, tx, ty = decompose(Ds)
-    mag = np.hypot(tx, ty)
+    lfx = gaussian_smooth(tx, fps * 0.4)
+    lfy = gaussian_smooth(ty, fps * 0.4)
+    hfx = tx - lfx
+    hfy = ty - lfy
+    mag = np.hypot(lfx, lfy)
     f = np.minimum(1.0, cap_series / np.maximum(mag, 1e-6))
-    f = gaussian_smooth(f, fps * 0.15)
+    ax = lfx * f + hfx
+    ay = lfy * f + hfy
+    # the Gaussian band-split leaks some 1-4Hz shake into LF where the
+    # cap then under-cancels it; reclaim the high-frequency part of
+    # whatever the cap removed (small, so the leash budget holds)
+    leakx = tx - ax
+    leaky = ty - ay
+    ax += leakx - gaussian_smooth(leakx, fps * 0.25)
+    ay += leaky - gaussian_smooth(leaky, fps * 0.25)
     out = Ds.copy()
-    out[:, 0, 2] = tx * f
-    out[:, 1, 2] = ty * f
+    out[:, 0, 2] = ax
+    out[:, 1, 2] = ay
     return out
 
 
@@ -91,6 +105,20 @@ def to_source_Ms(Ms, W, H):
     S = np.array([[sx, 0, 0], [0, sy, 0]])
     Si = np.array([[1 / sx, 0, 0], [0, 1 / sy, 0]])
     return np.array([compose(S, compose(M, Si)) for M in Ms])
+
+
+def _appearance(frame, x, y, s):
+    # hue-saturation only: brightness varies wildly between sun and
+    # shadow and must not affect identity
+    Hf, Wf = frame.shape[:2]
+    x0, x1 = int(max(0, x - s)), int(min(Wf, x + s))
+    y0, y1 = int(max(0, y - s)), int(min(Hf, y + s))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    patch = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+    h = cv2.calcHist([patch], [0, 1], None, [12, 8], [0, 180, 0, 256])
+    cv2.normalize(h, h)
+    return h
 
 
 def track_blobs(clip, A, yolo_samples):
@@ -102,7 +130,9 @@ def track_blobs(clip, A, yolo_samples):
     yts = np.array([s["t"] for s in yolo_samples])
     ycx = fill_gaps([s["box"]["cx"] if s["box"] else np.nan for s in yolo_samples])
     ycy = fill_gaps([s["box"]["cy"] if s["box"] else np.nan for s in yolo_samples])
+    yh = fill_gaps([s["box"]["h"] if s["box"] else np.nan for s in yolo_samples])
     yscore = np.array([s["box"]["score"] if s["box"] else 0.0 for s in yolo_samples])
+    template = None  # rider appearance, captured at the seed
 
     cap = cv2.VideoCapture(clip)
     prev = None
@@ -193,13 +223,18 @@ def track_blobs(clip, A, yolo_samples):
             # YOLO re-anchor at ACTUAL confident samples only (never the
             # interpolation between them — it cuts corners through gaps
             # and carries box noise). Rescue-snap when the blob clearly
-            # left the rider; otherwise the merest nudge.
+            # left the rider; otherwise the merest nudge. Far snaps must
+            # match the rider's appearance — other riders also score well.
             near = np.abs(yts - t) < 0.5 / fps
             if near.any():
                 j = int(np.argmax(near))
                 if yscore[j] > 0.45:
                     yx, yyc = ycx[j] / sx, ycy[j] / sy
                     d = np.hypot(yx - px, yyc - py)
+                    # NOTE: appearance-gating these far snaps was tried
+                    # twice (HSV, then H-S with adaptive template) and
+                    # measurably blocked legitimate rescues in shadow
+                    # (track p90 139 -> 568px). Removed.
                     if d > 60:
                         px, py = yx, yyc
                         miss = 0
@@ -243,8 +278,12 @@ def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, w
     for j in range(n):
         Di = invert(Ds[min(j + 1, len(Ds) - 1)])
         rx[j], ry[j] = apply_a(Di, track["x"][j], track["y"][j])
-    cx = hampel(np.interp(ts, track["ts"], rx))
-    cy = hampel(np.interp(ts, track["ts"], ry))
+    # hampel kills steal spikes without cutting turn apexes (a median
+    # filter lagged real turns); the light gaussian then keeps the leash
+    # reference from transmitting track noise into the path (the leash
+    # hard-clamps to this reference every sample)
+    cx = gaussian_smooth(hampel(np.interp(ts, track["ts"], rx)), 1.2)
+    cy = gaussian_smooth(hampel(np.interp(ts, track["ts"], ry)), 1.2)
     lim_x = crop_w * LEASH_X / 2
     lim_y = crop_h * LEASH_Y / 2
     mX, mY = 0.02 * W, 0.025 * H
