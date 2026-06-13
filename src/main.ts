@@ -2,15 +2,7 @@ import { runAnalysis, probeFps, type AnalysisResult } from './analyze';
 import { initDetector } from './detect';
 import { getClientId, persistExport, restoreExport, setClientId, uploadToDrive } from './drive';
 import { exportVideo } from './export';
-import {
-  apply,
-  attenuateResiduals,
-  buildResiduals,
-  decompose,
-  IDENTITY,
-  invert,
-  type Affine,
-} from './motion';
+import { apply, buildResiduals, decompose, IDENTITY, invert, type Affine } from './motion';
 import { buildCropPath, cropAt, gaussianSmooth, type Sample, type CropKey } from './path';
 import type { Point } from './tracker';
 
@@ -112,18 +104,9 @@ function rebuildPath() {
     widenArr[clampNum(Math.floor(t * fps), 0, widenArr.length - 1)] ?? 1;
 
   // Shake residuals, capped to what the crop's leash can absorb: full
-  // correction during violent maneuvers swings the rider (whom the
-  // drone chases) out of any leash — above the cap, ride along instead.
-  const pad = parseFloat(padSlider.value);
-  const raw = buildResiduals(analysis.incs, fps, smoothSec);
-  const caps = raw.map((_, i) => {
-    const k = clampNum(i, 0, hSmooth.length - 1);
-    const hBox = clampNum(hSmooth[k] * 1.6, 0.04 * h, 0.3 * h);
-    const cropH = clampNum(hBox * pad * (widenArr[k] ?? 1), h / MAX_ZOOM, h);
-    // leash fractions mirror path.ts (0.45 horizontal, 0.35 vertical)
-    return (0.8 * Math.min(0.45 * cropH * (w / h), 0.35 * cropH)) / 2;
-  });
-  Ds = attenuateResiduals(raw, caps, fps);
+  // NOTE: the correction-cap (attenuateResiduals) was a smoothness
+  // regression (user-confirmed) — reverted to full shake cancellation.
+  Ds = buildResiduals(analysis.incs, fps, smoothSec);
 
   // Rider track -> "intended camera" coordinates (shake removed), then
   // downsample to the path grid.

@@ -295,46 +295,6 @@ export function buildResiduals(
   return out;
 }
 
-/**
- * Cap only the LOW-frequency part of the correction translation.
- *
- * D.t = slow divergence (actual vs intended camera during maneuvers —
- * following it fully swings the rider, whom the drone chases, outside
- * any leash) + fast shake (must ALWAYS be fully canceled; capping the
- * total measured a 6x jitter regression). caps = 80% of the leash slack
- * per frame. The band-split leaks a little 1-4Hz shake into LF; the
- * high-frequency part of whatever the cap removed is re-added.
- */
-export function attenuateResiduals(Ds: Affine[], caps: number[], fps: number): Affine[] {
-  const tx = Ds.map((D) => D[2]);
-  const ty = Ds.map((D) => D[5]);
-  const lfx = gaussianSmoothArr(tx, fps * 0.4);
-  const lfy = gaussianSmoothArr(ty, fps * 0.4);
-  const ax: number[] = [];
-  const ay: number[] = [];
-  for (let i = 0; i < Ds.length; i++) {
-    const cap = caps[Math.min(i, caps.length - 1)] ?? Infinity;
-    const f = Math.min(1, cap / Math.max(Math.hypot(lfx[i], lfy[i]), 1e-6));
-    ax.push(lfx[i] * f + (tx[i] - lfx[i]));
-    ay.push(lfy[i] * f + (ty[i] - lfy[i]));
-  }
-  const leakx = tx.map((v, i) => v - ax[i]);
-  const leaky = ty.map((v, i) => v - ay[i]);
-  const lsx = gaussianSmoothArr(leakx, fps * 0.25);
-  const lsy = gaussianSmoothArr(leaky, fps * 0.25);
-  return Ds.map(
-    (D, i) =>
-      [
-        D[0],
-        D[1],
-        ax[i] + leakx[i] - lsx[i],
-        D[3],
-        D[4],
-        ay[i] + leaky[i] - lsy[i],
-      ] as Affine,
-  );
-}
-
 function gaussianSmoothArr(values: number[], sigma: number): number[] {
   if (sigma <= 0) return values.slice();
   const radius = Math.max(1, Math.ceil(sigma * 3));

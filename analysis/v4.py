@@ -268,22 +268,16 @@ def build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, smooth_sec=SMOOTH_SEC, w
     crop_h = np.clip(sph * pad * wfac, H / MAX_ZOOM, H)
     crop_w = crop_h * (W / H)
 
-    frame_ts = np.arange(len(Ds)) / fps
-    crop_h_f = np.interp(frame_ts, ts, crop_h)
-    cap = 0.8 * np.minimum(LEASH_X * crop_h_f * (W / H), LEASH_Y * crop_h_f) / 2
-    Ds = attenuate_residuals(Ds, cap, fps)
-
+    # NOTE: the correction-cap (attenuate_residuals) and Hampel reference
+    # were a smoothness REGRESSION (user-confirmed); reverted to the
+    # plain v2 config — full shake cancellation + median reference.
     rx = np.empty(n)
     ry = np.empty(n)
     for j in range(n):
         Di = invert(Ds[min(j + 1, len(Ds) - 1)])
         rx[j], ry[j] = apply_a(Di, track["x"][j], track["y"][j])
-    # hampel kills steal spikes without cutting turn apexes (a median
-    # filter lagged real turns); the light gaussian then keeps the leash
-    # reference from transmitting track noise into the path (the leash
-    # hard-clamps to this reference every sample)
-    cx = gaussian_smooth(hampel(np.interp(ts, track["ts"], rx)), 1.2)
-    cy = gaussian_smooth(hampel(np.interp(ts, track["ts"], ry)), 1.2)
+    cx = median_filter(np.interp(ts, track["ts"], rx))
+    cy = median_filter(np.interp(ts, track["ts"], ry))
     lim_x = crop_w * LEASH_X / 2
     lim_y = crop_h * LEASH_Y / 2
     mX, mY = 0.02 * W, 0.025 * H

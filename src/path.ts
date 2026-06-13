@@ -57,12 +57,11 @@ export function buildCropPath(
     return [{ t: 0, cx: srcW / 2, cy: srcH / 2, cropW: srcW, cropH: srcH }];
   }
 
-  // Hampel kills steal spikes without cutting turn apexes (a median
-  // filter lagged real turns by hundreds of px); the light gaussian
-  // keeps the leash reference from transmitting per-sample track noise
-  // into the path (the leash hard-clamps to this reference).
-  const cx = gaussianSmooth(hampel(fillGaps(samples.map((s) => s.box?.cx ?? null))), 1.2);
-  const cy = gaussianSmooth(hampel(fillGaps(samples.map((s) => s.box?.cy ?? null))), 1.2);
+  // Median filter before the Gaussian: a single bad box becomes a spike
+  // the Gaussian would smear into a visible lurch; the median removes it.
+  // (Hampel reference was reverted — part of the smoothness regression.)
+  const cx = medianFilter(fillGaps(samples.map((s) => s.box?.cx ?? null)));
+  const cy = medianFilter(fillGaps(samples.map((s) => s.box?.cy ?? null)));
   const ph = medianFilter(fillGaps(samples.map((s) => s.box?.h ?? null)));
 
   const sigma = opts.smoothSigmaSec / opts.sampleInterval;
@@ -179,20 +178,6 @@ function fillGaps(values: (number | null)[]): number[] {
   for (let i = 0; i < firstKnown; i++) out[i] = out[firstKnown];
   for (let i = prevKnown + 1; i < n; i++) out[i] = out[prevKnown];
   return out as number[];
-}
-
-function hampel(values: number[], radius = 3, k = 3, floorPx = 40): number[] {
-  const n = values.length;
-  const out = values.slice();
-  for (let i = 0; i < n; i++) {
-    const win = values.slice(Math.max(0, i - radius), Math.min(n, i + radius + 1));
-    const sorted = [...win].sort((a, b) => a - b);
-    const med = sorted[sorted.length >> 1];
-    const devs = win.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
-    const mad = devs[devs.length >> 1] * 1.4826;
-    if (Math.abs(values[i] - med) > Math.max(k * mad, floorPx)) out[i] = med;
-  }
-  return out;
 }
 
 function medianFilter(values: number[], radius = 2): number[] {

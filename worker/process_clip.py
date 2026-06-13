@@ -102,7 +102,7 @@ def process(clip_path, out_path, log=print):
     widen = (np.arange(len(wfac)) / fps, wfac)
 
     log("  building camera path…")
-    path, Ds = build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, widen=widen)
+    path, _ = build_path_v4(track, Ds, fps, W, H, pad=PAD_FACTOR, widen=widen)
 
     log("  rendering + H.264 encode…")
     render_ffmpeg(clip_path, out_path, path, Ds, fps, W, H)
