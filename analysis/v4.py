@@ -230,7 +230,12 @@ def track_blobs(clip, A, yolo_samples):
             near = np.abs(yts - t) < 0.5 / fps
             if near.any():
                 j = int(np.argmax(near))
-                if yscore[j] > 0.45:
+                # detect_pass already gated these for size + position
+                # continuity, so a present detection IS the validated
+                # rider — trust it for rescue at a low score (0.38), which
+                # catches the 0.40-0.44 detections in low-contrast grass
+                # where the blob otherwise wanders.
+                if yscore[j] > 0.38:
                     yx, yyc = ycx[j] / sx, ycy[j] / sy
                     d = np.hypot(yx - px, yyc - py)
                     # NOTE: appearance-gating these far snaps was tried
